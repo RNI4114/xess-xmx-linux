@@ -121,7 +121,9 @@ XeSS picks (and why `SIMD16Required` matters), frame generation, XeLL.
 ## FSR4
 
 AMD's FSR4 runs on Xe2's XMX units too, with a Mesa 27 driver built from `mesa27/` and a few Proton-side pieces in
-`fsr4/`: see [docs/fsr4.md](docs/fsr4.md). None of it is needed for XeSS.
+`fsr4/`: see [docs/fsr4.md](docs/fsr4.md). None of it is needed for XeSS. It builds on this project's XMX path (the
+igdext shim, the C-for-Metal kernel injection, the packaging, all by HHHHanasak1) and reuses its driver patches
+unchanged.
 
 ## Repository
 

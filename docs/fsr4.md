@@ -1,5 +1,7 @@
 # FSR4 on XMX (Intel Xe2)
 
+*This builds on HHHHanasak1's xess-xmx-linux, which made the XMX path possible: the igdext shim, the C-for-Metal kernel injection in ANV and the packaging. The FSR4 work is an addition on top of it and reuses its driver patches unchanged (`patches/mesa-26.3`).*
+
 AMD's FSR4 (4.1.1) runs on an Arc B580 through Proton, the way AMD's driver offers it on Windows: games with FSR 3.1
 get FSR4 in their own upscaler menu; games without it get it through OptiScaler. Its INT8 model runs on the XMX units
 (DPAS), its FP8 model on cooperative matrices. This branch has the driver, the Proton-side patches, a small proxy DLL
