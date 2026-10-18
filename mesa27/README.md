@@ -3,6 +3,9 @@
 Patch series on top of Mesa main **`4c12390be30`** (2026-10-18), in parts, so each can be taken or left. This is the
 driver the fs4-xmx work was tested with: applying everything below gives the exact tree of that build.
 
+**Tested only on an Arc B580 (Xe2).** Nothing here was tried on Xe3; the RT (`3-rt-bvh`) and Jay parts in particular
+may behave differently there.
+
 **Order:** first this repository's `patches/mesa-26.3/` (0001-0004: the XeSS C-for-Metal injection, its debug tools,
 Large GRF around CM kernels and the divergent-barrier crash fix), which apply to Mesa main as they are; then the parts
 here, in their numeric order. Every part applies on the ones before it; the XeSS-only driver is `patches/mesa-26.3`

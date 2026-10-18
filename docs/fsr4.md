@@ -8,6 +8,9 @@ get FSR4 in their own upscaler menu; games without it get it through OptiScaler.
 and a launcher. **Nothing from AMD is here**: FSR4's DLL comes from the user, and no weights or shaders of it are in
 this repository.
 
+**Tested only on an Arc B580 (Xe2).** Nothing here was tried on Xe3; the driver parts (RT and Jay especially) may
+behave differently there.
+
 ## What it takes
 
 | piece | where | what it does |
