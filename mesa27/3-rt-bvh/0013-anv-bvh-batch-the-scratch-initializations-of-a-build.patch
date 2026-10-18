@@ -1,0 +1,379 @@
+From 0ed9d3214716fe3b1d348130711de111cc6b0379 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 23:44:57 -0300
+Subject: [PATCH 13/21] anv/bvh: batch the scratch initializations of a build
+ call in one dispatch
+
+The IR header of every build (write_buffer_cp), the morton sort and
+H-PLOC fills and the refit arrival counters were one blorp op each: a
+compute dispatch with its own state, plus a texture cache invalidation
+for every header copy. Cyberpunk rebuilds ~50 small BLAS per frame, so
+~220 serialized blorp ops (~0.5 ms) ran before/between the first build
+stages, and ~30 more before each refit.
+
+Record them while vk_cmd_build_acceleration_structures() runs and execute
+them all in one init.comp dispatch at the next flush_buffer_write_cp().
+The common code now also calls flush_buffer_write_cp() after the scratch
+fills.
+
+tlascheck (TC_BLAS=51 TC_REFIT=141, clock pinned at 2850 MHz by load):
+refit of 141 BLAS 1.139 -> 0.792 ms, rebuild of 51 BLAS 0.710 -> 0.569 ms,
+0 wrong rays; rtcheck, ascopy and overrun clean.
+
+ANV_BVH_BLORP_INIT=1 restores the blorp path for A/B.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit dd6b5765fa1c24ad97d7d7ec04e86833567d82d3)
+(cherry picked from commit c6d3d061ab6a3097e3f76bbec8d70c0390be2bad)
+---
+ src/intel/vulkan/anv_private.h                |   1 +
+ src/intel/vulkan/bvh/anv_bvh_defines.h        |  27 +++
+ src/intel/vulkan/bvh/init.comp                |  36 ++++
+ src/intel/vulkan/bvh/meson.build              |   1 +
+ .../vulkan/genX_acceleration_structure.c      | 175 +++++++++++++++++-
+ .../runtime/vk_acceleration_structure.c       |   2 +
+ 6 files changed, 238 insertions(+), 4 deletions(-)
+ create mode 100644 src/intel/vulkan/bvh/init.comp
+
+diff --git a/src/intel/vulkan/anv_private.h b/src/intel/vulkan/anv_private.h
+index c20d6dcabfc..be3130e8e1e 100644
+--- a/src/intel/vulkan/anv_private.h
++++ b/src/intel/vulkan/anv_private.h
+@@ -2614,6 +2614,7 @@ enum anv_object_key_bvh_type {
+    ANV_OBJECT_KEY_BVH_HEADER,
+    ANV_OBJECT_KEY_BVH_COPY,
+    ANV_OBJECT_KEY_BVH_UPDATE,
++   ANV_OBJECT_KEY_BVH_INIT,
+ };
+ 
+ enum bvh_dump_type {
+diff --git a/src/intel/vulkan/bvh/anv_bvh_defines.h b/src/intel/vulkan/bvh/anv_bvh_defines.h
+index c15d84b8bf6..f38eff92a12 100644
+--- a/src/intel/vulkan/bvh/anv_bvh_defines.h
++++ b/src/intel/vulkan/bvh/anv_bvh_defines.h
+@@ -489,4 +489,31 @@ struct copy_args {
+    uint8_t accel_struct_compat[VK_UUID_SIZE];
+ };
+ 
++/* init.comp: the small scratch initializations of one vkCmdBuild* call
++ * (IR headers, sort counters, refit arrival counters...) in one dispatch.
++ * Workgroup (x, y) writes dwords [y * ANV_BVH_INIT_CHUNK, +ANV_BVH_INIT_CHUNK)
++ * of op x.
++ */
++#define ANV_BVH_INIT_WG_SIZE 64
++#define ANV_BVH_INIT_CHUNK   4096
++#define ANV_BVH_INIT_FILL    0xffffffffu
++
++struct bvh_init_op {
++   VOID_REF dst;
++   uint32_t dwords;
++   /* dword index in bvh_init_args::data, or ANV_BVH_INIT_FILL */
++   uint32_t src;
++   uint32_t value;
++   uint32_t pad;
++};
++
++struct bvh_init_args {
++   VOID_REF ops;
++   VOID_REF data;
++};
++
++#ifdef VULKAN
++TYPE(bvh_init_op, 8);
++#endif
++
+ #endif
+diff --git a/src/intel/vulkan/bvh/init.comp b/src/intel/vulkan/bvh/init.comp
+new file mode 100644
+index 00000000000..df73f92528f
+--- /dev/null
++++ b/src/intel/vulkan/bvh/init.comp
+@@ -0,0 +1,36 @@
++/* Copyright © 2026 Intel Corporation
++ * SPDX-License-Identifier: MIT
++ *
++ * Batched scratch initialization for one vkCmdBuildAccelerationStructures
++ * call: every op is a copy of a few dwords (IR headers) or a fill (sort and
++ * refit counters).  One dispatch replaces a blorp op per BLAS.
++ */
++
++#version 460
++
++layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++#include "anv_bvh_defines.h"
++#define VK_USED_BUILD_FLAGS (0)
++#include "anv_bvh_helpers.h"
++
++layout(push_constant) uniform CONSTS {
++   bvh_init_args args;
++};
++
++void
++main(void)
++{
++   REF(bvh_init_op) op = INDEX(bvh_init_op, args.ops, gl_WorkGroupID.x);
++   uint32_t dwords = DEREF(op).dwords;
++   uint32_t src = DEREF(op).src;
++   uint32_t value = DEREF(op).value;
++   VOID_REF dst = DEREF(op).dst;
++
++   uint32_t begin = gl_WorkGroupID.y * ANV_BVH_INIT_CHUNK;
++   uint32_t end = min(begin + ANV_BVH_INIT_CHUNK, dwords);
++   for (uint32_t i = begin + gl_LocalInvocationID.x; i < end; i += ANV_BVH_INIT_WG_SIZE) {
++      uint32_t v = src == ANV_BVH_INIT_FILL ? value : DEREF(INDEX(uint32_t, args.data, src + i));
++      DEREF(INDEX(uint32_t, dst, i)) = v;
++   }
++}
+diff --git a/src/intel/vulkan/bvh/meson.build b/src/intel/vulkan/bvh/meson.build
+index 7e8175d93ca..1552c6ffac4 100644
+--- a/src/intel/vulkan/bvh/meson.build
++++ b/src/intel/vulkan/bvh/meson.build
+@@ -10,6 +10,7 @@ bvh_shaders = [
+   'copy.comp',
+   'update.comp',
+   'pair_triangles.comp',
++  'init.comp',
+ ]
+ 
+ # A mapping: [filename version, GFX_VERx10 define version]
+diff --git a/src/intel/vulkan/genX_acceleration_structure.c b/src/intel/vulkan/genX_acceleration_structure.c
+index aed19064591..b3ea9c31790 100644
+--- a/src/intel/vulkan/genX_acceleration_structure.c
++++ b/src/intel/vulkan/genX_acceleration_structure.c
+@@ -240,6 +240,7 @@ debug_record_as_to_bvh_dump(struct anv_cmd_buffer *cmd_buffer,
+ #define COPY_SPV_PATH STRINGIFY(bvh/genX(copy).spv.h)
+ #define UPDATE_SPV_PATH STRINGIFY(bvh/genX(update).spv.h)
+ #define PAIR_TRIANGLES_SPV_PATH STRINGIFY(bvh/genX(pair_triangles).spv.h)
++#define INIT_SPV_PATH STRINGIFY(bvh/genX(init).spv.h)
+ 
+ static const uint32_t encode_spv[] = {
+ #include ENCODE_SPV_PATH
+@@ -268,6 +269,10 @@ static const uint32_t pair_triangles_spv[] = {
+ #include PAIR_TRIANGLES_SPV_PATH
+ };
+ 
++static const uint32_t init_spv[] = {
++#include INIT_SPV_PATH
++};
++
+ static void
+ get_bvh_layout(const struct vk_acceleration_structure_build_state *state,
+                struct bvh_layout *layout)
+@@ -826,6 +831,152 @@ anv_get_update_scratch_size(VkDevice _device,
+    return scratch.size;
+ }
+ 
++/* Scratch initializations of a build call (the IR header of every build, the
++ * morton sort counters, the refit arrival counters, the H-PLOC ranges) are
++ * collected while vk_cmd_build_acceleration_structures() records, and run as
++ * one init.comp dispatch at the next flush_buffer_write_cp().  They used to
++ * be one blorp op each: a whole compute dispatch with its own state, and the
++ * header copy also queued a texture cache invalidation.  With the ~50 small
++ * BLAS a frame Cyberpunk rebuilds, that was ~170 serialized blorp ops
++ * (~400 µs) before the first build stage.
++ *
++ * ANV_BVH_BLORP_INIT=1 goes back to blorp for an A/B (local switch).
++ */
++struct anv_bvh_init_batch {
++   struct anv_cmd_buffer *cmd_buffer;
++   struct util_dynarray ops;  /* struct bvh_init_op */
++   struct util_dynarray data; /* uint32_t */
++   uint32_t max_dwords;
++};
++
++/* Only valid while genX(CmdBuildAccelerationStructuresKHR) records. */
++static __thread struct anv_bvh_init_batch *anv_bvh_init_cur;
++
++/* the ops and the header data share one temporary state allocation */
++#define ANV_BVH_INIT_MAX_BYTES (8 * 1024)
++
++static bool
++anv_bvh_init_batching(void)
++{
++   static int blorp = -1;
++   if (blorp < 0)
++      blorp = debug_get_bool_option("ANV_BVH_BLORP_INIT", false);
++   return !blorp;
++}
++
++static struct anv_bvh_init_batch *
++anv_bvh_init_batch_for(struct anv_cmd_buffer *cmd_buffer, uint64_t addr,
++                       uint64_t size)
++{
++   struct anv_bvh_init_batch *batch = anv_bvh_init_cur;
++   if (!batch || batch->cmd_buffer != cmd_buffer || (addr & 3) || (size & 3) ||
++       size / 4 > UINT32_MAX)
++      return NULL;
++   return batch;
++}
++
++static void
++anv_bvh_init_flush(struct anv_cmd_buffer *cmd_buffer)
++{
++   struct anv_bvh_init_batch *batch = anv_bvh_init_cur;
++   if (!batch || batch->cmd_buffer != cmd_buffer || batch->ops.size == 0)
++      return;
++
++   VkCommandBuffer commandBuffer = anv_cmd_buffer_to_handle(cmd_buffer);
++   uint32_t ops_size = batch->ops.size, n_ops = ops_size / sizeof(struct bvh_init_op);
++
++   struct anv_state tmp =
++      anv_cmd_buffer_alloc_temporary_state(cmd_buffer, ops_size + batch->data.size, 64);
++   memcpy(tmp.map, batch->ops.data, ops_size);
++   if (batch->data.size)
++      memcpy((char *)tmp.map + ops_size, batch->data.data, batch->data.size);
++   uint64_t va = anv_address_physical(anv_cmd_buffer_temporary_state_address(cmd_buffer, tmp));
++
++   anv_bvh_build_bind_pipeline(commandBuffer, ANV_OBJECT_KEY_BVH_INIT,
++                               init_spv, sizeof(init_spv),
++                               sizeof(struct bvh_init_args), 0);
++   struct bvh_init_args args = {
++      .ops = va,
++      .data = va + ops_size,
++   };
++   anv_bvh_build_set_args(commandBuffer, &args, sizeof(args));
++   vk_common_CmdDispatch(commandBuffer, n_ops,
++                         DIV_ROUND_UP(batch->max_dwords, ANV_BVH_INIT_CHUNK), 1);
++
++   util_dynarray_clear(&batch->ops);
++   util_dynarray_clear(&batch->data);
++   batch->max_dwords = 0;
++}
++
++static void
++anv_bvh_init_add(struct anv_cmd_buffer *cmd_buffer,
++                 struct anv_bvh_init_batch *batch, uint64_t addr,
++                 const void *data, uint32_t value, uint64_t size)
++{
++   uint32_t data_bytes = data ? size : 0;
++   if (batch->ops.size + batch->data.size + sizeof(struct bvh_init_op) + data_bytes >
++       ANV_BVH_INIT_MAX_BYTES)
++      anv_bvh_init_flush(cmd_buffer);
++
++   struct bvh_init_op op = {
++      .dst = addr,
++      .dwords = size / 4,
++      .src = data ? batch->data.size / 4 : ANV_BVH_INIT_FILL,
++      .value = value,
++   };
++   util_dynarray_append(&batch->ops, op);
++   if (data)
++      util_dynarray_append_array(&batch->data, uint8_t, data, data_bytes);
++   batch->max_dwords = MAX2(batch->max_dwords, op.dwords);
++}
++
++static void
++anv_bvh_write_buffer_cp(VkCommandBuffer commandBuffer,
++                        VkDeviceAddress dstAddr,
++                        void *data,
++                        uint32_t size)
++{
++   ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
++
++   struct anv_bvh_init_batch *batch =
++      size <= ANV_BVH_INIT_MAX_BYTES / 2 ?
++      anv_bvh_init_batch_for(cmd_buffer, dstAddr, size) : NULL;
++   if (!batch) {
++      anv_cmd_write_buffer_cp(commandBuffer, dstAddr, data, size);
++      return;
++   }
++
++   anv_bvh_init_add(cmd_buffer, batch, dstAddr, data, 0, size);
++}
++
++static void
++anv_bvh_flush_buffer_write_cp(VkCommandBuffer commandBuffer)
++{
++   ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
++
++   anv_bvh_init_flush(cmd_buffer);
++   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
++   anv_cmd_flush_buffer_write_cp(commandBuffer);
++}
++
++static void
++anv_bvh_fill_buffer_addr(VkCommandBuffer commandBuffer,
++                         VkDeviceAddress dstAddr,
++                         VkDeviceSize fillSize,
++                         uint32_t data)
++{
++   ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
++
++   struct anv_bvh_init_batch *batch =
++      anv_bvh_init_batch_for(cmd_buffer, dstAddr, fillSize);
++   if (!batch) {
++      anv_cmd_fill_buffer_addr(commandBuffer, dstAddr, fillSize, data);
++      return;
++   }
++
++   anv_bvh_init_add(cmd_buffer, batch, dstAddr, NULL, data, fillSize);
++}
++
+ static void
+ anv_init_update_scratch(VkCommandBuffer commandBuffer,
+                         const struct vk_acceleration_structure_build_state *states,
+@@ -848,7 +999,7 @@ anv_init_update_scratch(VkCommandBuffer commandBuffer,
+       /* The update shader writes every AABB before reading it.  Only the
+        * arrival counters need to be initialized.
+        */
+-      anv_cmd_fill_buffer_addr(commandBuffer, scratch, layout.aabb_offset,
++      anv_bvh_fill_buffer_addr(commandBuffer, scratch, layout.aabb_offset,
+                                0x0);
+    }
+ }
+@@ -1085,10 +1236,10 @@ anv_device_init_accel_struct_build_state(struct anv_device *device)
+       goto exit;
+ 
+    device->vk.as_build_ops = &anv_build_ops;
+-   device->vk.write_buffer_cp = anv_cmd_write_buffer_cp;
+-   device->vk.flush_buffer_write_cp = anv_cmd_flush_buffer_write_cp;
++   device->vk.write_buffer_cp = anv_bvh_write_buffer_cp;
++   device->vk.flush_buffer_write_cp = anv_bvh_flush_buffer_write_cp;
+    device->vk.cmd_dispatch_unaligned = anv_cmd_dispatch_unaligned;
+-   device->vk.cmd_fill_buffer_addr = anv_cmd_fill_buffer_addr;
++   device->vk.cmd_fill_buffer_addr = anv_bvh_fill_buffer_addr;
+ 
+    device->accel_struct_build.build_args =
+       (struct vk_acceleration_structure_build_args) {
+@@ -1179,11 +1330,27 @@ genX(CmdBuildAccelerationStructuresKHR)(
+     */
+    genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
+ 
++   struct anv_bvh_init_batch init_batch = { .cmd_buffer = cmd_buffer };
++   if (anv_bvh_init_batching()) {
++      util_dynarray_init(&init_batch.ops, NULL);
++      util_dynarray_init(&init_batch.data, NULL);
++      anv_bvh_init_cur = &init_batch;
++   }
++
+    vk_cmd_build_acceleration_structures(commandBuffer, &device->vk,
+                                         &device->meta_device, infoCount,
+                                         pInfos, ppBuildRangeInfos,
+                                         &device->accel_struct_build.build_args);
+ 
++   if (anv_bvh_init_cur) {
++      /* the common code flushes after every init; this only matters if a
++       * stage failed half way */
++      anv_bvh_init_flush(cmd_buffer);
++      anv_bvh_init_cur = NULL;
++      util_dynarray_fini(&init_batch.ops);
++      util_dynarray_fini(&init_batch.data);
++   }
++
+    anv_cmd_buffer_restore_state(cmd_buffer, &saved);
+ }
+ 
+diff --git a/src/vulkan/runtime/vk_acceleration_structure.c b/src/vulkan/runtime/vk_acceleration_structure.c
+index 6df72b2ff82..318eca19eb1 100644
+--- a/src/vulkan/runtime/vk_acceleration_structure.c
++++ b/src/vulkan/runtime/vk_acceleration_structure.c
+@@ -1350,6 +1350,8 @@ vk_cmd_build_acceleration_structures(VkCommandBuffer commandBuffer,
+       }
+ 
+       }
++      /* Drivers may batch the fills until the next flush. */
++      device->flush_buffer_write_cp(commandBuffer);
+       vk_bvh_build_barrier_transfer_to_compute(commandBuffer);
+       vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+ 

@@ -1,0 +1,121 @@
+From bd6bbe986b586681c116c61092580a44fbac6e8a Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 08:55:02 -0300
+Subject: [PATCH] fs4-xmx: VKD3D_XMX_WMMA exposes D3D12 WMMA on Intel ANV
+
+- accept the 8-bit accumulator gap on ANV when VKD3D_XMX_WMMA=1 (the fs4-xmx driver handles u8 matrices)
+- load the amdxc64 shim on ANV under VKD3D_XMX_WMMA so FSR4 finds the AGS path
+- pin cooperative-matrix compute shaders to subgroup 32 under VKD3D_XMX_WMMA (WMMA code assumes wave32)
+- build with enable_extended_emulation by default (FP8 WMMA through u8 storage + FP16 math)
+
+Without VKD3D_XMX_WMMA the behaviour on Intel is unchanged: the minimum coopmat caps still fail and
+WMMA stays unexposed.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ libs/vkd3d/device.c        | 29 ++++++++++++++++++++++++++++-
+ libs/vkd3d/state.c         | 12 ++++++++++++
+ libs/vkd3d/vkd3d_private.h |  1 +
+ meson_options.txt          |  2 +-
+ 4 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 817f8a80..1f91066e 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -1088,6 +1088,23 @@ static bool d3d12_device_determine_additional_shading_rates_supported(struct d3d
+     return additional_shading_rates_supported == ARRAY_SIZE(additional_shading_rates);
+ }
+ 
++/* VKD3D_XMX_WMMA=1 (fs4-xmx): the Vulkan driver is the Intel ANV build that implements the 16x16 wave32
++ * cooperative matrices D3D12 WMMA needs (FP8 emulated through u8 storage + FP16 math), so treat it like the
++ * AMD drivers where WMMA is gated on vendor. Off by default: a stock ANV would run these shaders wrongly. */
++bool vkd3d_xmx_wmma_enabled(void)
++{
++    static int enabled = -1;
++    char value[8];
++
++    if (enabled < 0)
++    {
++        enabled = vkd3d_get_env_var("VKD3D_XMX_WMMA", value, sizeof(value)) && strcmp(value, "1") == 0;
++        if (enabled)
++            INFO("VKD3D_XMX_WMMA: exposing WMMA on Intel ANV.\n");
++    }
++    return enabled;
++}
++
+ bool d3d12_device_supports_required_subgroup_size_for_stage(
+         struct d3d12_device *device, VkShaderStageFlagBits stage)
+ {
+@@ -2437,6 +2454,14 @@ static bool vkd3d_supports_minimum_coopmat_caps(struct d3d12_device *device)
+                      "This is required for FSR4 and happens to work in practice on AMD GPUs.\n");
+                 break;
+ 
++            case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
++                if (vkd3d_xmx_wmma_enabled())
++                {
++                    WARN("8-bit Accumulator type not exposed; VKD3D_XMX_WMMA says the ANV build handles it.\n");
++                    break;
++                }
++                return false;
++
+             default:
+                 /* This is out of spec and known to segfault some drivers, so just don't bother.
+                  * FSR4 is only relevant on AMD GPUs anyway. */
+@@ -3121,7 +3146,9 @@ static void d3d12_device_init_vendor_hacks(struct d3d12_device *device)
+ #ifdef _WIN64
+     /* Don't try to load the native amdxc64.dll, that will only crash since AMD's driver will
+      * assume certain things about their own ID3D12Device implementation. */
+-    if (GetModuleHandleA("winevulkan.dll") && device->device_info.properties2.properties.vendorID == 0x1002)
++    if (GetModuleHandleA("winevulkan.dll") && (device->device_info.properties2.properties.vendorID == 0x1002 ||
++            (vkd3d_xmx_wmma_enabled() && device->device_info.vulkan_1_2_properties.driverID ==
++                    VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)))
+     {
+         device->vendor_hacks.amdxc64 = LoadLibraryA("amdxc64.dll");
+         if (device->vendor_hacks.amdxc64)
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 1945f15a..6a84a310 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3218,6 +3218,18 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
+                 subgroup_size_alignment = 64;
+                 override_subgroup_size = true;
+             }
++            /* VKD3D_XMX_WMMA: WMMA shaders are written for AMD wave32 (lane ids 0..31 address shared memory,
++             * one 16x16 matrix per wave). The wave size heuristic only asks for 32 when the device can go above
++             * it, which ANV (16..32) cannot, so pin it here. */
++            else if (vkd3d_xmx_wmma_enabled() &&
++                    (spirv_code->meta.flags & VKD3D_SHADER_META_FLAG_USES_COOPERATIVE_MATRIX) &&
++                    device->d3d12_caps.options1.WaveLaneCountMin <= 32 &&
++                    device->d3d12_caps.options1.WaveLaneCountMax >= 32 &&
++                    d3d12_device_supports_required_subgroup_size_for_stage(device, stage))
++            {
++                subgroup_size_alignment = 32;
++                override_subgroup_size = true;
++            }
+             /* [WaveSize(min,max,preferred)] in SM 6.8, or [WaveSize(N)] in SM 6.6. */
+             else if (spirv_code->meta.cs_wave_size_preferred &&
+                     spirv_code->meta.cs_wave_size_preferred >= device->d3d12_caps.options1.WaveLaneCountMin &&
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 3e71f89c..53d9e45e 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -6250,6 +6250,7 @@ bool d3d12_device_supports_variable_shading_rate_tier_1(struct d3d12_device *dev
+ bool d3d12_device_supports_variable_shading_rate_tier_2(struct d3d12_device *device);
+ bool d3d12_device_supports_ray_tracing_tier_1_0(const struct d3d12_device *device);
+ UINT d3d12_determine_shading_rate_image_tile_size(struct d3d12_device *device);
++bool vkd3d_xmx_wmma_enabled(void);
+ bool d3d12_device_supports_required_subgroup_size_for_stage(
+         struct d3d12_device *device, VkShaderStageFlagBits stage);
+ bool d3d12_device_supports_workgraphs(const struct d3d12_device *device);
+diff --git a/meson_options.txt b/meson_options.txt
+index bac0610d..f4573623 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -3,5 +3,5 @@ option('enable_extras',             type : 'boolean', value : false)
+ option('enable_profiling',          type : 'boolean', value : false)
+ option('enable_renderdoc',          type : 'boolean', value : false)
+ option('enable_descriptor_qa',      type : 'boolean', value : false)
+-option('enable_extended_emulation', type : 'boolean', value : 'false')
++option('enable_extended_emulation', type : 'boolean', value : 'true')
+ option('enable_trace',              type : 'combo',   value : 'auto', choices : ['false', 'true', 'auto'])

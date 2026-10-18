@@ -1,0 +1,117 @@
+From 2f71dfb84978290c0cd2235e463a4d3058793003 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 14:43:48 -0300
+Subject: [PATCH 3/9] jay: let DPAS read A in place from a subgroup block read
+
+A DPAS whose A operand comes straight from load_*_block_intel now reads
+the UGPRs the transposed message wrote (GRF aligned, NoMask) instead of
+the per-lane copy into a GPR. The copy is masked, so in non-uniform
+control flow the inactive lanes of A were never written, while DPAS
+reads the whole operand.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/compiler/jay/jay_from_nir.c | 27 ++++++++++++++++++++++++++-
+ src/intel/compiler/jay/jay_ir.h       |  5 +++--
+ src/intel/compiler/jay/jay_validate.c |  3 ++-
+ 3 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/src/intel/compiler/jay/jay_from_nir.c b/src/intel/compiler/jay/jay_from_nir.c
+index 15e4d93d739..8ab3d563eef 100644
+--- a/src/intel/compiler/jay/jay_from_nir.c
++++ b/src/intel/compiler/jay/jay_from_nir.c
+@@ -121,6 +121,12 @@ struct nir_to_jay_state {
+    /* Bitset of defs optimized for ballots */
+    BITSET_WORD *zero_inactive;
+ 
++   /* Subgroup block reads: the UGPRs the message wrote (one GRF per component),
++    * which a DPAS can read in place as its A operand.
++    */
++   BITSET_WORD *has_block_ugprs;
++   jay_def *block_ugprs;
++
+    bool needs_final_halt;
+    bool efficient_64bit;
+ 
+@@ -1644,6 +1650,11 @@ jay_emit_mem_access_lsc(struct nir_to_jay_state *nj, nir_intrinsic_instr *intr)
+                   .use_raw_ex_desc = surf_type == LSC_ADDR_SURFTYPE_SS);
+       }
+ 
++      if (has_dest) {
++         BITSET_SET(nj->has_block_ugprs, intr->def.index);
++         nj->block_ugprs[intr->def.index] = tmp;
++      }
++
+       /* Each GRF worth of UGPRs is one 32-bit GPR value */
+       if (has_dest) jay_foreach_comp(dst, i) {
+          jay_MOV(b, jay_extract(dst, i),
+@@ -2292,10 +2303,20 @@ jay_emit_dpas(struct nir_to_jay_state *nj, nir_intrinsic_instr *intr)
+ 
+    jay_builder *b = &nj->bld;
+    jay_def dst = nj_def(&intr->def);
++   /* A straight from a subgroup block read: read the UGPRs the message wrote
++    * (NoMask, so complete in non-uniform control flow) instead of the per-lane
++    * copy.
++    */
++   const nir_def *a = intr->src[2].ssa;
++   const unsigned a_bytes = nir_intrinsic_repeat_count(intr) *
++                            nir_intrinsic_systolic_depth(intr) * 4;
++   const bool a_ugprs = BITSET_TEST(nj->has_block_ugprs, a->index) &&
++                        a->num_components * nj->s->dispatch_width * 4 == a_bytes;
++
+    jay_def src[3] = {
+       src0_use_null ? jay_null() : jay_as_gpr(b, nj_src(intr->src[0])),
+       jay_as_gpr(b, nj_src(intr->src[1])),
+-      jay_as_gpr(b, nj_src(intr->src[2])),
++      a_ugprs ? nj->block_ugprs[a->index] : jay_as_gpr(b, nj_src(intr->src[2])),
+    };
+ 
+    jay_DPAS(b, dst, src[0], src[1], src[2], nir_intrinsic_systolic_depth(intr),
+@@ -4948,6 +4969,8 @@ jay_from_nir_function(const struct intel_device_info *devinfo,
+ 
+    nj.exit_block = jay_new_block(f, nj.weight);
+    nj.zero_inactive = BITSET_CALLOC(f->ssa_alloc);
++   nj.has_block_ugprs = BITSET_CALLOC(impl->ssa_alloc);
++   nj.block_ugprs = calloc(impl->ssa_alloc, sizeof(jay_def));
+    jay_emit_cf_list(&nj, &impl->body);
+    jay_block_add_successor(nj.current_block, nj.exit_block, GPR);
+ 
+@@ -4955,6 +4978,8 @@ jay_from_nir_function(const struct intel_device_info *devinfo,
+    jay_emit_task_mesh_fence_workaround(&nj);
+    jay_emit_eot(&nj);
+    free(nj.zero_inactive);
++   free(nj.has_block_ugprs);
++   free(nj.block_ugprs);
+    util_dynarray_fini(&nj.converge_blocks);
+ }
+ 
+diff --git a/src/intel/compiler/jay/jay_ir.h b/src/intel/compiler/jay/jay_ir.h
+index 0ad32b9c0d9..499d10044fd 100644
+--- a/src/intel/compiler/jay/jay_ir.h
++++ b/src/intel/compiler/jay/jay_ir.h
+@@ -941,8 +941,9 @@ jay_clobbers_address_reg(const jay_inst *I)
+ static inline unsigned
+ jay_src_alignment(jay_shader *shader, const jay_inst *I, unsigned s)
+ {
+-   /* SENDs operate on entire GRFs at a time, so align UGPRs to GRFs. */
+-   if (I->op == JAY_OPCODE_SEND && I->src[s].file == UGPR) {
++   /* SENDs and DPAS operate on entire GRFs at a time, so align UGPRs to GRFs. */
++   if ((I->op == JAY_OPCODE_SEND || I->op == JAY_OPCODE_DPAS) &&
++       I->src[s].file == UGPR) {
+       return jay_ugpr_per_grf(shader);
+    }
+ 
+diff --git a/src/intel/compiler/jay/jay_validate.c b/src/intel/compiler/jay/jay_validate.c
+index 2c1e0dddeaf..6db3d6acaf9 100644
+--- a/src/intel/compiler/jay/jay_validate.c
++++ b/src/intel/compiler/jay/jay_validate.c
+@@ -125,7 +125,8 @@ get_src_words(struct validate_state *validate, jay_inst *I, unsigned s)
+          UNREACHABLE("invalid DPAS source");
+       }
+ 
+-      return bytes / (shader->dispatch_width * 4);
++      /* A may be UGPRs, one GRF of them per GPR word */
++      return bytes / (I->src[s].file == UGPR ? 4 : shader->dispatch_width * 4);
+    }
+ 
+    if (I->op == JAY_OPCODE_SLICE_REPACK && !jay_slice_repack_unpack(I))

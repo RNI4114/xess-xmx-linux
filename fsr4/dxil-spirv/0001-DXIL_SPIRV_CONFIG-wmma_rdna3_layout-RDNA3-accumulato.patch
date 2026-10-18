@@ -1,0 +1,57 @@
+From c00e8fa6c4dd60f9855f117cdf2443b25ae1887d Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 09:12:36 -0300
+Subject: [PATCH] DXIL_SPIRV_CONFIG=wmma_rdna3_layout: RDNA3 accumulator layout
+ fixup alone
+
+The column-oriented alloca rewrite of wmma_rdna3_workaround, without its
+FP16 RTZ mode and out of spec use conversions, for drivers whose 16x16
+wave32 accumulator holds rows as RDNA3 does (Intel ANV, fs4-xmx).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ dxil_converter.cpp         | 2 ++
+ opcodes/converter_impl.hpp | 3 +++
+ opcodes/dxil/dxil_ags.cpp  | 2 +-
+ 3 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/dxil_converter.cpp b/dxil_converter.cpp
+index f94b77ec..d07ea139 100644
+--- a/dxil_converter.cpp
++++ b/dxil_converter.cpp
+@@ -9988,6 +9988,8 @@ GlobalConfiguration::GlobalConfiguration()
+ 	{
+ 		if (strcmp(env, "wmma_rdna3_workaround") == 0)
+ 			wmma_rdna3_workaround = true;
++		else if (strcmp(env, "wmma_rdna3_layout") == 0)
++			wmma_rdna3_layout = true;
+ 		else if (strcmp(env, "wmma_conv_hack") == 0)
+ 			wmma_conv_hack = true;
+ 		else if (strcmp(env, "debug_simulate_min16float_min_spec") == 0)
+diff --git a/opcodes/converter_impl.hpp b/opcodes/converter_impl.hpp
+index 668cb7ca..5c255ad3 100644
+--- a/opcodes/converter_impl.hpp
++++ b/opcodes/converter_impl.hpp
+@@ -169,6 +169,9 @@ public:
+ 	// Only used for temporary hackery and testing.
+ 	static const GlobalConfiguration &get();
+ 	bool wmma_rdna3_workaround = false;
++	// Only the RDNA3 accumulator layout fixup of wmma_rdna3_workaround (no RTZ, no out of spec use conversions),
++	// for drivers whose 16x16 accumulator holds rows like RDNA3 does (Intel ANV in wave32).
++	bool wmma_rdna3_layout = false;
+ 	bool wmma_conv_hack = false;
+ 	bool simulate_min16float_min_spec = false;
+ 
+diff --git a/opcodes/dxil/dxil_ags.cpp b/opcodes/dxil/dxil_ags.cpp
+index 6426251c..c8866858 100644
+--- a/opcodes/dxil/dxil_ags.cpp
++++ b/opcodes/dxil/dxil_ags.cpp
+@@ -2211,7 +2211,7 @@ static void analyze_dubious_implementation_defined_column_behavior(
+ 	// This has different results on RDNA4 and RDNA3 and we can detect
+ 	// this very specific case and rewrite the GEP to hack around it.
+ 
+-	if (!GlobalConfiguration::get().wmma_rdna3_workaround)
++	if (!GlobalConfiguration::get().wmma_rdna3_workaround && !GlobalConfiguration::get().wmma_rdna3_layout)
+ 		return;
+ 
+ 	if (const auto *binop = llvm::dyn_cast<llvm::BinaryOperator>(value))

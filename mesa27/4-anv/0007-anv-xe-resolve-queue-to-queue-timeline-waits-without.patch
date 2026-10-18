@@ -1,0 +1,648 @@
+From 4178f6f741afee08a539a044e7775b5ea0d26e62 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 16:53:45 -0300
+Subject: [PATCH 07/10] anv/xe: resolve queue-to-queue timeline waits without
+ the kernel (experimental)
+
+Same-queue waits on values already signaled by an earlier submission of the
+same queue are dropped (jobs of one exec queue run in order). Waits of the
+compute queue on hot semaphores signaled by another queue poll a memory slot
+with MI_SEMAPHORE_WAIT; signaling submissions publish the value from a tail
+batch the last command buffer jumps to. Render queue waits stay kernel
+dependencies: an active render context makes the compute engine ~2.5x slower
+on BMG. ANV_XQ=0 disables, ANV_XQ_SAME/ANV_XQ_CROSS/ANV_XQ_ONLY/ANV_XQ_LIGHT/
+ANV_XQ_SMEM/ANV_XQ_STATS for experiments. Test: rt-profiling/morta/xqtest.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit c367195b1a5a2c45f042bcf4f5dbef661e603734)
+(cherry picked from commit 8f364e41056552027294bdb20a32ed8d2246630c)
+---
+ src/intel/vulkan/anv_device.c         |   6 +
+ src/intel/vulkan/anv_genX.h           |  11 +
+ src/intel/vulkan/anv_private.h        |  21 ++
+ src/intel/vulkan/anv_queue.c          |  21 ++
+ src/intel/vulkan/genX_cmd_buffer.c    |  65 +++++
+ src/intel/vulkan/xe/anv_batch_chain.c | 350 +++++++++++++++++++++++++-
+ src/intel/vulkan/xe/anv_batch_chain.h |   5 +
+ 7 files changed, 478 insertions(+), 1 deletion(-)
+
+diff --git a/src/intel/vulkan/anv_device.c b/src/intel/vulkan/anv_device.c
+index 889d8a48b72..558fa2ce175 100644
+--- a/src/intel/vulkan/anv_device.c
++++ b/src/intel/vulkan/anv_device.c
+@@ -30,6 +30,7 @@
+ #include <xf86drm.h>
+ 
+ #include "anv_private.h"
++#include "xe/anv_batch_chain.h"
+ #include "anv_measure.h"
+ #include "anv_shader.h"
+ #include "anv_slab_bo.h"
+@@ -1155,6 +1156,9 @@ VkResult anv_CreateDevice(
+    if (result != VK_SUCCESS)
+       goto fail_ray_query_bo;
+ 
++   if (device->info->kmd_type == INTEL_KMD_TYPE_XE)
++      anv_xq_init(device);
++
+    /* Emit the CPS states before running the initialization batch as those
+     * structures are referenced.
+     */
+@@ -1435,6 +1439,7 @@ VkResult anv_CreateDevice(
+    anv_scratch_pool_finish(device, &device->scratch_pool);
+    anv_scratch_pool_finish(device, &device->protected_scratch_pool);
+  fail_trivial_batch:
++   anv_xq_finish(device);
+    ANV_DMR_BO_FREE(&device->vk.base, device->trivial_batch_bo);
+    anv_device_release_bo(device, device->trivial_batch_bo);
+  fail_ray_query_bo:
+@@ -1599,6 +1604,7 @@ void anv_DestroyDevice(
+       ANV_DMR_BO_FREE(&device->vk.base, device->mem_fence_bo);
+       anv_device_release_bo(device, device->mem_fence_bo);
+    }
++   anv_xq_finish(device);
+    ANV_DMR_BO_FREE(&device->vk.base, device->trivial_batch_bo);
+    anv_device_release_bo(device, device->trivial_batch_bo);
+ 
+diff --git a/src/intel/vulkan/anv_genX.h b/src/intel/vulkan/anv_genX.h
+index 033e29e4552..72ea8139d10 100644
+--- a/src/intel/vulkan/anv_genX.h
++++ b/src/intel/vulkan/anv_genX.h
+@@ -416,6 +416,17 @@ genX(batch_emit_pipe_control) (a, b, c, d, __func__)
+ #define genx_batch_emit_pipe_control_write(a, b, c, d, e, f, g) \
+ genX(batch_emit_pipe_control_write) (a, b, c, d, e, f, g, __func__)
+ 
++/* LOCAL (rt-profiling/morta): GPU-side cross-queue waits, see xe/anv_batch_chain.c */
++void genX(xq_emit_waits)(struct anv_batch *batch,
++                         const struct intel_device_info *devinfo,
++                         const uint64_t *addrs, const uint32_t *vals,
++                         uint32_t count);
++void genX(xq_emit_signals)(struct anv_batch *batch,
++                           const struct intel_device_info *devinfo,
++                           uint32_t current_pipeline,
++                           const uint64_t *addrs, const uint32_t *vals,
++                           uint32_t count);
++
+ void genX(batch_emit_breakpoint)(struct anv_batch *batch,
+                                  struct anv_device *device,
+                                  bool emit_before_draw);
+diff --git a/src/intel/vulkan/anv_private.h b/src/intel/vulkan/anv_private.h
+index a7c27f0b05f..c9ca5d09da3 100644
+--- a/src/intel/vulkan/anv_private.h
++++ b/src/intel/vulkan/anv_private.h
+@@ -2971,6 +2971,27 @@ struct anv_device {
+    } slab_parent_cache;
+    bool slab_parent_cache_enabled;
+ 
++   /* LOCAL (rt-profiling/morta): waits between queues resolved on the GPU
++    * (MI_SEMAPHORE_WAIT on a per-semaphore memory slot) or dropped when the
++    * semaphore is signaled by the same queue, instead of a kernel dependency
++    * that costs a fence -> IRQ -> drm_sched -> GuC round trip. See
++    * xe/anv_batch_chain.c.
++    */
++   struct {
++      bool                                      enabled;
++      bool                                      same;
++      bool                                      cross;
++      simple_mtx_t                              mutex;
++      struct hash_table *                       sems;
++      struct anv_bo *                           slots_bo;
++      uint32_t                                  next_slot;
++      uint32_t                                  num_slots;
++      struct anv_bo *                           ring_bo;
++      uint32_t                                  ring_next;
++      uint32_t                                  ring_entries;
++      uint64_t                                  stat_same, stat_cross, stat_kept;
++   } xq;
++
+    struct {
+       mtx_t mutex;
+       struct u_cnd_monotonic lost_cnd;
+diff --git a/src/intel/vulkan/anv_queue.c b/src/intel/vulkan/anv_queue.c
+index d19f8249e6d..b5c8de99dfd 100644
+--- a/src/intel/vulkan/anv_queue.c
++++ b/src/intel/vulkan/anv_queue.c
+@@ -31,6 +31,8 @@
+ #include "xe/anv_queue.h"
+ 
+ #include "vk_common_entrypoints.h"
++#include "vk_semaphore.h"
++#include "xe/anv_batch_chain.h"
+ 
+ static VkResult
+ anv_create_engine(struct anv_device *device,
+@@ -141,3 +143,22 @@ anv_queue_finish(struct anv_queue *queue)
+    anv_destroy_engine(queue);
+    vk_queue_finish(&queue->vk);
+ }
++
++/* LOCAL (rt-profiling/morta): forget the GPU-side wait state of a semaphore
++ * before its vk_sync can be reused by another one (see anv_xq_* in
++ * xe/anv_batch_chain.c).
++ */
++VKAPI_ATTR void VKAPI_CALL
++anv_DestroySemaphore(VkDevice _device, VkSemaphore _semaphore,
++                     const VkAllocationCallbacks *pAllocator)
++{
++   ANV_FROM_HANDLE(anv_device, device, _device);
++   VK_FROM_HANDLE(vk_semaphore, semaphore, _semaphore);
++
++   if (semaphore && device->info->kmd_type == INTEL_KMD_TYPE_XE) {
++      anv_xq_forget_sync(device, &semaphore->permanent);
++      anv_xq_forget_sync(device, semaphore->temporary);
++   }
++
++   vk_common_DestroySemaphore(_device, _semaphore, pAllocator);
++}
+diff --git a/src/intel/vulkan/genX_cmd_buffer.c b/src/intel/vulkan/genX_cmd_buffer.c
+index 3d1daf3e5ea..2387a0f2893 100644
+--- a/src/intel/vulkan/genX_cmd_buffer.c
++++ b/src/intel/vulkan/genX_cmd_buffer.c
+@@ -3597,6 +3597,71 @@ genX(batch_emit_pipe_control_write)(struct anv_batch *batch,
+                      post_sync_op, address, imm_data, bits);
+ }
+ 
++/* LOCAL (rt-profiling/morta): GPU-side cross-queue waits.
++ *
++ * The waits run at the start of a submission, after the kernel already
++ * invalidated the caches for it, so nothing stale can have been loaded on
++ * this engine while polling; the invalidation below is only belt and braces.
++ */
++void
++genX(xq_emit_waits)(struct anv_batch *batch,
++                    const struct intel_device_info *devinfo,
++                    const uint64_t *addrs, const uint32_t *vals,
++                    uint32_t count)
++{
++   for (uint32_t i = 0; i < count; i++) {
++      anv_batch_emit(batch, GENX(MI_SEMAPHORE_WAIT), sem) {
++         sem.WaitMode            = PollingMode;
++         sem.CompareOperation    = COMPARE_SAD_GREATER_THAN_OR_EQUAL_SDD;
++         sem.SemaphoreDataDword  = vals[i];
++         sem.SemaphoreAddress    = (struct anv_address) { NULL, addrs[i] };
++      }
++   }
++   if (count) {
++      genx_batch_emit_pipe_control(batch, devinfo, GPGPU,
++                                   ANV_PIPE_CS_STALL_BIT |
++                                   ANV_PIPE_STATE_CACHE_INVALIDATE_BIT |
++                                   ANV_PIPE_CONSTANT_CACHE_INVALIDATE_BIT |
++                                   ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT |
++                                   ANV_PIPE_INSTRUCTION_CACHE_INVALIDATE_BIT);
++   }
++}
++
++/* Flush everything the submission wrote, then publish the semaphore values.
++ * current_pipeline is the pipeline the batch was left in (UINT32_MAX when the
++ * submission never selected one, i.e. did no 3D/compute work).
++ */
++void
++genX(xq_emit_signals)(struct anv_batch *batch,
++                      const struct intel_device_info *devinfo,
++                      uint32_t current_pipeline,
++                      const uint64_t *addrs, const uint32_t *vals,
++                      uint32_t count)
++{
++   const uint32_t pipe = current_pipeline == _3D ? _3D : GPGPU;
++   enum anv_pipe_bits flush = ANV_PIPE_FLUSH_BITS | ANV_PIPE_CS_STALL_BIT;
++   static int light = -1;
++   if (light < 0)
++      light = debug_get_num_option("ANV_XQ_LIGHT", 0);
++   if (light == 1)  /* L1 only: the L3 is shared by all engines */
++      flush = ANV_PIPE_HDC_PIPELINE_FLUSH_BIT |
++              ANV_PIPE_UNTYPED_DATAPORT_CACHE_FLUSH_BIT |
++              ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
++              ANV_PIPE_DEPTH_CACHE_FLUSH_BIT | ANV_PIPE_CS_STALL_BIT;
++   else if (light == 2)
++      flush = ANV_PIPE_CS_STALL_BIT;
++   if (pipe != _3D)
++      flush &= ~ANV_PIPE_GFX_BITS;
++   genx_batch_emit_pipe_control(batch, devinfo, pipe, flush);
++
++   for (uint32_t i = 0; i < count; i++) {
++      const struct anv_address addr = { NULL, addrs[i] };
++      genx_batch_emit_pipe_control_write(batch, devinfo, pipe,
++                                         WriteImmediateData, addr,
++                                         vals[i], ANV_PIPE_CS_STALL_BIT);
++   }
++}
++
+ /* Set preemption on/off. */
+ void
+ genX(batch_set_preemption)(struct anv_batch *batch,
+diff --git a/src/intel/vulkan/xe/anv_batch_chain.c b/src/intel/vulkan/xe/anv_batch_chain.c
+index 6543691dce5..aac3c4b0085 100644
+--- a/src/intel/vulkan/xe/anv_batch_chain.c
++++ b/src/intel/vulkan/xe/anv_batch_chain.c
+@@ -28,6 +28,10 @@
+ #include "common/intel_bind_timeline.h"
+ #include "common/xe/intel_gem.h"
+ #include "perf/intel_perf.h"
++#include "util/hash_table.h"
++#include "util/u_debug.h"
++#include "vk_drm_syncobj.h"
++#include "genxml/gen90_pack.h"
+ 
+ #include "drm-uapi/xe_drm.h"
+ 
+@@ -274,6 +278,276 @@ xe_companion_rcs_queue_exec_locked(struct anv_queue *queue,
+    return result;
+ }
+ 
++
++/* LOCAL (rt-profiling/morta): waits between queues without the kernel.
++ *
++ * vkd3d-proton turns every D3D12 queue Wait into a timeline semaphore wait,
++ * which xe turns into a drm_sched dependency: the job is only handed to the
++ * GuC after the signaling job completed, its fence IRQ was handled and the
++ * scheduler worker ran (~70-130 us on BMG, several times per frame).
++ *
++ * - same queue: a wait on a value already signaled by an earlier submission
++ *   of this same queue is dropped; jobs of one exec queue run in order with
++ *   a flush + CS stall between them.
++ * - cross queue: semaphores that get waited on from another queue become
++ *   "hot". Submissions that signal a hot semaphore end with a flush and a
++ *   memory write of the value into a per-semaphore slot (the last command
++ *   buffer jumps to a small tail batch), and a later wait on a value whose
++ *   signal submission was already handed to the kernel polls that slot with
++ *   MI_SEMAPHORE_WAIT at the start of the waiting submission instead.
++ *
++ * Only for timeline, non-shareable semaphores always signaled by one queue,
++ * with 32-bit values. By default only the compute engine polls: on BMG an
++ * active render context (even just polling) makes the compute engine about
++ * 2.5x slower, while a polling compute context does not hurt the render
++ * engine (morta/xqtest). ANV_XQ=0 disables it, ANV_XQ_SAME/ANV_XQ_CROSS=0 each
++ * half.
++ */
++struct anv_xq_sem {
++   uint32_t slot;
++   struct anv_queue *owner;
++   uint64_t max_any;   /* highest value signaled by owner, submitted */
++   uint64_t max_tail;  /* highest value published to the slot, submitted */
++   bool poisoned;
++   bool hot;
++};
++
++#define XQ_SLOT_STRIDE 64
++#define XQ_RING_ENTRY 512
++#define XQ_MAX 8
++
++void
++anv_xq_init(struct anv_device *device)
++{
++   device->xq.enabled = debug_get_bool_option("ANV_XQ", true);
++   device->xq.same = debug_get_bool_option("ANV_XQ_SAME", true);
++   device->xq.cross = debug_get_bool_option("ANV_XQ_CROSS", true);
++   simple_mtx_init(&device->xq.mutex, mtx_plain);
++   device->xq.sems = _mesa_pointer_hash_table_create(NULL);
++   if (!device->xq.enabled || !device->xq.sems)
++      goto disable;
++
++   device->xq.num_slots = 4096;
++   const enum anv_bo_alloc_flags slot_flags =
++      debug_get_bool_option("ANV_XQ_SMEM", false) ?
++      (ANV_BO_ALLOC_NO_LOCAL_MEM | ANV_BO_ALLOC_HOST_COHERENT) : 0;
++   if (anv_device_alloc_bo(device, "xq-slots",
++                           device->xq.num_slots * XQ_SLOT_STRIDE, slot_flags, 0,
++                           &device->xq.slots_bo) != VK_SUCCESS)
++      goto disable;
++
++   device->xq.ring_entries = 4096;
++   if (anv_device_alloc_bo(device, "xq-ring",
++                           device->xq.ring_entries * XQ_RING_ENTRY,
++                           ANV_BO_ALLOC_BATCH_BUFFER_INTERNAL_FLAGS, 0,
++                           &device->xq.ring_bo) != VK_SUCCESS) {
++      anv_device_release_bo(device, device->xq.slots_bo);
++      device->xq.slots_bo = NULL;
++      goto disable;
++   }
++   return;
++
++disable:
++   device->xq.enabled = false;
++}
++
++void
++anv_xq_finish(struct anv_device *device)
++{
++   if (!device->xq.sems)
++      return;
++   if (debug_get_bool_option("ANV_XQ_STATS", false)) {
++      fprintf(stderr, "ANV_XQ: same-queue waits dropped %llu, cross-queue waits on GPU %llu, kept %llu, sems %u\n",
++              (unsigned long long)device->xq.stat_same,
++              (unsigned long long)device->xq.stat_cross,
++              (unsigned long long)device->xq.stat_kept, device->xq.next_slot);
++   }
++   if (device->xq.ring_bo)
++      anv_device_release_bo(device, device->xq.ring_bo);
++   if (device->xq.slots_bo)
++      anv_device_release_bo(device, device->xq.slots_bo);
++   if (device->xq.sems) {
++      hash_table_foreach(device->xq.sems, e)
++         free(e->data);
++      _mesa_hash_table_destroy(device->xq.sems, NULL);
++   }
++   simple_mtx_destroy(&device->xq.mutex);
++}
++
++void
++anv_xq_forget_sync(struct anv_device *device, struct vk_sync *sync)
++{
++   if (!device->xq.sems || !sync)
++      return;
++   simple_mtx_lock(&device->xq.mutex);
++   struct hash_entry *e = _mesa_hash_table_search(device->xq.sems, sync);
++   if (e) {
++      free(e->data);
++      _mesa_hash_table_remove(device->xq.sems, e);
++   }
++   simple_mtx_unlock(&device->xq.mutex);
++}
++
++static bool
++xq_sync_ok(const struct vk_sync *sync)
++{
++   return (sync->flags & VK_SYNC_IS_TIMELINE) &&
++          !(sync->flags & VK_SYNC_IS_SHAREABLE) &&
++          vk_sync_type_is_drm_syncobj(sync->type);
++}
++
++static uint64_t
++xq_slot_addr(struct anv_device *device, const struct anv_xq_sem *xs)
++{
++   return device->xq.slots_bo->offset + (uint64_t)xs->slot * XQ_SLOT_STRIDE;
++}
++
++struct xq_plan {
++   uint32_t nw, ns, nupd;
++   uint64_t waddr[XQ_MAX], saddr[XQ_MAX];
++   uint32_t wval[XQ_MAX], sval[XQ_MAX];
++   struct anv_xq_sem *upd[2 * XQ_MAX];
++   uint64_t upd_val[2 * XQ_MAX];
++   bool upd_tail[2 * XQ_MAX];
++   uint32_t same, kept;
++};
++
++/* Decides which waits stay kernel dependencies (copied to kept_waits) and
++ * which semaphore values get published by this submission.
++ */
++static void
++xq_plan(struct anv_queue *queue, bool can_head, bool can_tail,
++        uint32_t wait_count, const struct vk_sync_wait *waits,
++        uint32_t signal_count, const struct vk_sync_signal *signals,
++        struct vk_sync_wait *kept_waits, uint32_t *kept_count,
++        struct xq_plan *plan)
++{
++   struct anv_device *device = queue->device;
++   memset(plan, 0, sizeof(*plan));
++   *kept_count = 0;
++
++   simple_mtx_lock(&device->xq.mutex);
++   for (uint32_t i = 0; i < wait_count; i++) {
++      const struct vk_sync_wait *w = &waits[i];
++      struct hash_entry *he = xq_sync_ok(w->sync) ?
++         _mesa_hash_table_search(device->xq.sems, w->sync) : NULL;
++      struct anv_xq_sem *xs = he ? he->data : NULL;
++
++      if (xs && !xs->poisoned && xs->owner == queue) {
++         if (device->xq.same && xs->max_any >= w->wait_value) {
++            plan->same++;
++            continue;
++         }
++      } else if (xs && !xs->poisoned && xs->owner) {
++         xs->hot = true;
++         static int only = -1;
++         if (only < 0)
++            only = debug_get_num_option("ANV_XQ_ONLY", 2); /* 0 all, 1 render, 2 compute */
++         const bool eng_ok = only == 0 ||
++            (only == 1 && queue->family->engine_class == INTEL_ENGINE_CLASS_RENDER) ||
++            (only == 2 && queue->family->engine_class == INTEL_ENGINE_CLASS_COMPUTE);
++         if (device->xq.cross && eng_ok && can_head && plan->nw < XQ_MAX &&
++             xs->max_tail >= w->wait_value) {
++            plan->waddr[plan->nw] = xq_slot_addr(device, xs);
++            plan->wval[plan->nw] = w->wait_value;
++            plan->nw++;
++            continue;
++         }
++      }
++      kept_waits[(*kept_count)++] = *w;
++      plan->kept++;
++   }
++
++   for (uint32_t i = 0; i < signal_count; i++) {
++      const struct vk_sync_signal *sg = &signals[i];
++      if (!xq_sync_ok(sg->sync))
++         continue;
++      struct hash_entry *he = _mesa_hash_table_search(device->xq.sems, sg->sync);
++      struct anv_xq_sem *xs = he ? he->data : NULL;
++      if (!xs) {
++         if (device->xq.next_slot >= device->xq.num_slots)
++            continue;
++         xs = calloc(1, sizeof(*xs));
++         if (!xs)
++            continue;
++         xs->slot = device->xq.next_slot++;
++         _mesa_hash_table_insert(device->xq.sems, sg->sync, xs);
++      }
++      if (!xs->owner)
++         xs->owner = queue;
++      else if (xs->owner != queue)
++         xs->poisoned = true;
++      if (sg->signal_value > UINT32_MAX)
++         xs->poisoned = true;
++      if (xs->poisoned || plan->nupd >= ARRAY_SIZE(plan->upd))
++         continue;
++
++      bool tail = xs->hot && device->xq.cross && can_tail && plan->ns < XQ_MAX;
++      if (tail) {
++         plan->saddr[plan->ns] = xq_slot_addr(device, xs);
++         plan->sval[plan->ns] = sg->signal_value;
++         plan->ns++;
++      }
++      plan->upd[plan->nupd] = xs;
++      plan->upd_val[plan->nupd] = sg->signal_value;
++      plan->upd_tail[plan->nupd] = tail;
++      plan->nupd++;
++   }
++   simple_mtx_unlock(&device->xq.mutex);
++}
++
++static void
++xq_commit(struct anv_device *device, struct xq_plan *plan)
++{
++   simple_mtx_lock(&device->xq.mutex);
++   for (uint32_t i = 0; i < plan->nupd; i++) {
++      struct anv_xq_sem *xs = plan->upd[i];
++      xs->max_any = MAX2(xs->max_any, plan->upd_val[i]);
++      if (plan->upd_tail[i])
++         xs->max_tail = MAX2(xs->max_tail, plan->upd_val[i]);
++   }
++   device->xq.stat_same += plan->same;
++   device->xq.stat_cross += plan->nw;
++   device->xq.stat_kept += plan->kept;
++   simple_mtx_unlock(&device->xq.mutex);
++}
++
++static struct anv_batch
++xq_ring_batch(struct anv_device *device, struct anv_queue *queue, uint64_t *addr)
++{
++   simple_mtx_lock(&device->xq.mutex);
++   uint32_t idx = device->xq.ring_next++ % device->xq.ring_entries;
++   simple_mtx_unlock(&device->xq.mutex);
++   void *map = device->xq.ring_bo->map + (size_t)idx * XQ_RING_ENTRY;
++   *addr = device->xq.ring_bo->offset + (uint64_t)idx * XQ_RING_ENTRY;
++   return (struct anv_batch) {
++      .start = map,
++      .next = map,
++      .end = map + XQ_RING_ENTRY,
++      .engine_class = queue->family->engine_class,
++   };
++}
++
++static void
++xq_emit_jump(struct anv_batch *batch, uint64_t addr)
++{
++   struct GFX9_MI_BATCH_BUFFER_START bbs = {
++      __anv_cmd_header(GFX9_MI_BATCH_BUFFER_START),
++      .SecondLevelBatchBuffer  = Firstlevelbatch,
++      .AddressSpaceIndicator   = ASI_PPGTT,
++      .BatchBufferStartAddress = (struct anv_address) { NULL, addr },
++   };
++   uint32_t *dw = anv_batch_emit_dwords(batch, GFX9_MI_BATCH_BUFFER_START_length);
++   __anv_cmd_pack(GFX9_MI_BATCH_BUFFER_START)(NULL, dw, &bbs);
++}
++
++static void
++xq_emit_end(struct anv_batch *batch)
++{
++   anv_batch_emit(batch, GFX9_MI_BATCH_BUFFER_END, bbe);
++   anv_batch_emit(batch, GFX9_MI_NOOP, noop);
++}
++
+ VkResult
+ xe_queue_exec_locked(struct anv_queue *queue,
+                      uint32_t wait_count,
+@@ -294,15 +568,33 @@ xe_queue_exec_locked(struct anv_queue *queue,
+       wait_count == 0 && signal_count == 1 &&
+       !(signals[0].sync->flags & VK_SYNC_IS_SHAREABLE);
+ 
++   /* LOCAL (rt-profiling/morta): see anv_xq_* above. */
++   const bool xq_on = device->xq.enabled && !perf_query_pool &&
++      (cmd_buffer_count == 0 ? !is_queue_wait_idle :
++       (anv_cmd_buffer_is_chainable(cmd_buffers[0]) &&
++        !cmd_buffers[0]->companion_rcs_cmd_buffer));
++   struct xq_plan xq_plan_data;
++   STACK_ARRAY(struct vk_sync_wait, xq_waits, MAX2(wait_count, 1));
++   uint32_t xq_wait_count = wait_count;
++   const struct vk_sync_wait *exec_waits = waits;
++   if (xq_on && xq_waits) {
++      xq_plan(queue, true, true, wait_count, waits, signal_count, signals,
++              xq_waits, &xq_wait_count, &xq_plan_data);
++      exec_waits = xq_waits;
++   } else {
++      memset(&xq_plan_data, 0, sizeof(xq_plan_data));
++   }
++
+    struct drm_xe_sync *xe_syncs = NULL;
+    uint32_t xe_syncs_count = 0;
+-   result = xe_exec_process_syncs(queue, wait_count, waits,
++   result = xe_exec_process_syncs(queue, xq_wait_count, exec_waits,
+                                   signal_count, signals,
+                                   0, NULL, /* extra_syncs */
+                                   utrace_submit,
+                                   false, /* is_companion_rcs_queue */
+                                   can_skip_bind_timeline,
+                                   &xe_syncs, &xe_syncs_count);
++   STACK_ARRAY_FINISH(xq_waits);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -340,9 +632,63 @@ xe_queue_exec_locked(struct anv_queue *queue,
+       struct anv_batch_bo *first_batch_bo = list_first_entry(&first_cmd_buffer->batch_bos,
+                                                              struct anv_batch_bo, link);
+       exec.address = first_batch_bo->bo->offset;
++
++      if (xq_on && xq_plan_data.ns) {
++         /* The last command buffer jumps to a tail that publishes the
++          * semaphore values, instead of ending the batch.
++          */
++         uint32_t pipe = UINT32_MAX;
++         for (uint32_t i = 0; i < cmd_buffer_count; i++) {
++            if (cmd_buffers[i]->state.current_pipeline != UINT32_MAX)
++               pipe = cmd_buffers[i]->state.current_pipeline;
++         }
++         uint64_t tail_addr;
++         struct anv_batch tail = xq_ring_batch(device, queue, &tail_addr);
++         anv_genX(device->info, xq_emit_signals)(&tail, device->info, pipe,
++                                                 xq_plan_data.saddr,
++                                                 xq_plan_data.sval,
++                                                 xq_plan_data.ns);
++         xq_emit_end(&tail);
++
++         struct anv_cmd_buffer *last = cmd_buffers[cmd_buffer_count - 1];
++         struct anv_batch jump = {
++            .start = last->batch_end,
++            .next = last->batch_end,
++            .end = last->batch_end + GFX9_MI_BATCH_BUFFER_START_length * 4,
++         };
++         xq_emit_jump(&jump, tail_addr);
++      }
++      if (xq_on && xq_plan_data.nw) {
++         uint64_t head_addr;
++         struct anv_batch head = xq_ring_batch(device, queue, &head_addr);
++         anv_genX(device->info, xq_emit_waits)(&head, device->info,
++                                               xq_plan_data.waddr,
++                                               xq_plan_data.wval,
++                                               xq_plan_data.nw);
++         xq_emit_jump(&head, exec.address);
++         exec.address = head_addr;
++      }
+    } else if (!is_queue_wait_idle) {
+       exec.num_batch_buffer = 1;
+       exec.address = device->trivial_batch_bo->offset;
++
++      if (xq_on && (xq_plan_data.nw || xq_plan_data.ns)) {
++         uint64_t addr;
++         struct anv_batch b = xq_ring_batch(device, queue, &addr);
++         anv_genX(device->info, xq_emit_waits)(&b, device->info,
++                                               xq_plan_data.waddr,
++                                               xq_plan_data.wval,
++                                               xq_plan_data.nw);
++         if (xq_plan_data.ns) {
++            anv_genX(device->info, xq_emit_signals)(&b, device->info,
++                                                    UINT32_MAX,
++                                                    xq_plan_data.saddr,
++                                                    xq_plan_data.sval,
++                                                    xq_plan_data.ns);
++         }
++         xq_emit_end(&b);
++         exec.address = addr;
++      }
+    }
+ 
+    xe_exec_print_debug(queue, cmd_buffer_count, cmd_buffers, perf_query_pool,
+@@ -401,6 +747,8 @@ xe_queue_exec_locked(struct anv_queue *queue,
+ 
+    if (result == VK_SUCCESS)
+       result = xe_exec_ioctl(queue, &exec);
++   if (result == VK_SUCCESS && xq_on)
++      xq_commit(device, &xq_plan_data);
+ 
+    vk_free(&device->vk.alloc, xe_syncs);
+ 
+diff --git a/src/intel/vulkan/xe/anv_batch_chain.h b/src/intel/vulkan/xe/anv_batch_chain.h
+index 65801c4515e..4f8671bdd74 100644
+--- a/src/intel/vulkan/xe/anv_batch_chain.h
++++ b/src/intel/vulkan/xe/anv_batch_chain.h
+@@ -37,6 +37,11 @@ struct anv_query_pool;
+ struct anv_async_submit;
+ struct anv_utrace_submit;
+ 
++struct anv_device;
++void anv_xq_init(struct anv_device *device);
++void anv_xq_finish(struct anv_device *device);
++void anv_xq_forget_sync(struct anv_device *device, struct vk_sync *sync);
++
+ VkResult
+ xe_queue_exec_locked(struct anv_queue *queue,
+                      uint32_t wait_count,

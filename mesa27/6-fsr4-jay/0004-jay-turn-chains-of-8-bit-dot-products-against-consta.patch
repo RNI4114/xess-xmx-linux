@@ -1,0 +1,499 @@
+From 7481fed985a5864f10a9b6fbfb26748dd010b7cf Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 14:43:48 -0300
+Subject: [PATCH 4/9] jay: turn chains of 8-bit dot products against constant
+ weights into DPAS
+
+Per-pixel networks (FSR4's INT8 model through vkd3d-proton) compute
+acc[c] += dot4(x[k], W[c][k]) with W as immediates. Across a SIMD16
+subgroup that is an int8 DPAS with the invocations' x as B and the
+results landing where acc already is; only the weights move, to the
+shader's constant data, read as A by a subgroup block read.
+
+Shaders are pinned to SIMD16 unless they require another subgroup size
+and can observe it. Non-uniform blocks are handled when not in a loop
+and every non-uniform if around them has an empty other side (bounds
+checks), since DPAS writes all lanes. Bit exact; INTEL_DOT4_DPAS=0
+turns it off. On FSR4 4.1.1 INT8, 7 of the 14 dot product shaders (the
+heavy ones) go from SIMD32 with spills to SIMD16 without dp4a or spills.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/compiler/jay/jay_nir.c              |   5 +
+ src/intel/compiler/jay/jay_nir_dot4_to_dpas.c | 424 ++++++++++++++++++
+ src/intel/compiler/jay/jay_private.h          |   2 +
+ src/intel/compiler/jay/meson.build            |   1 +
+ 4 files changed, 432 insertions(+)
+ create mode 100644 src/intel/compiler/jay/jay_nir_dot4_to_dpas.c
+
+diff --git a/src/intel/compiler/jay/jay_nir.c b/src/intel/compiler/jay/jay_nir.c
+index d32a314ec64..0b8d9089936 100644
+--- a/src/intel/compiler/jay/jay_nir.c
++++ b/src/intel/compiler/jay/jay_nir.c
+@@ -991,6 +991,11 @@ jay_process_nir(const struct intel_device_info *devinfo,
+       BRW_NIR_PASS(nir_opt_offsets, &offset_options);
+    }
+ 
++   /* Before the memory access lowering in brw_postprocess_nir_opts, which
++    * handles the weight loads this adds.
++    */
++   JAY_NIR_PASS(jay_nir_dot4_to_dpas, devinfo);
++
+    brw_postprocess_nir_opts(pt);
+ }
+ 
+diff --git a/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c b/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c
+new file mode 100644
+index 00000000000..6e338c944f3
+--- /dev/null
++++ b/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c
+@@ -0,0 +1,424 @@
++/*
++ * Copyright 2026 Intel Corporation
++ * SPDX-License-Identifier: MIT
++ */
++
++/**
++ * Turn chains of 8-bit dot products against constant weights into DPAS.
++ *
++ * Shaders that run a small neural network per pixel (FSR4's INT8 model through
++ * vkd3d-proton, for example) do, in each invocation,
++ *
++ *    acc[c] = init[c] + sum_k dot4(x[k], W[c][k])
++ *
++ * for many output channels c over the same input dwords x[k], with W baked in
++ * as immediates. Across a SIMD16 subgroup that is D = C + W * X with the
++ * invocations as the N dimension, which is exactly an int8 DPAS: in SIMD16
++ * the B operand is one dword of 4 int8 per invocation per systolic step (the
++ * x[k] the invocation already has), and the result is one int32 per
++ * invocation per row (the acc[c] it already has). Only the weights move, into
++ * the shader's constant data, laid out as the A operand.
++ *
++ * One DPAS (8 rows x systolic depth 8) replaces 64 dot products and the 64
++ * moves of immediates they need. Integer arithmetic: the results are bit
++ * exact. Groups are padded with zero weights and zero inputs.
++ *
++ * The shader is pinned to SIMD16 (where the layouts match one to one); shaders
++ * that require another subgroup size, and can tell, are left alone.
++ * INTEL_DOT4_DPAS=0 turns the pass off.
++ *
++ * brw_nir_opt_systolic_vectorize does the same for weights loaded from an
++ * SSBO (XeSS); this handles weights that are constants.
++ */
++
++#include "util/u_dynarray.h"
++#include "util/hash_table.h"
++#include "util/u_debug.h"
++#include "compiler/nir/nir_builder.h"
++#include "intel/compiler/intel_shader.h"
++#include "jay_private.h"
++
++#define DPAS_ROWS 8
++#define DPAS_DEPTH 8
++
++struct dot {
++   nir_alu_instr *alu;
++   nir_scalar x;
++   uint32_t w;
++   unsigned index;          /* position in the block */
++};
++
++struct chain {
++   struct dot *dots;        /* head first */
++   unsigned len;
++   nir_scalar init;
++   bool grouped;
++};
++
++static bool
++is_dot_op(nir_op op)
++{
++   return op == nir_op_sdot_4x8_iadd || op == nir_op_udot_4x8_uadd;
++}
++
++/* The dot product of a non-constant dword against a constant one */
++static bool
++match_dot(nir_alu_instr *alu, struct dot *d)
++{
++   if (!is_dot_op(alu->op) || alu->def.bit_size != 32 ||
++       alu->def.num_components != 1)
++      return false;
++
++   nir_scalar s0 = nir_scalar_chase_movs(nir_get_scalar(alu->src[0].src.ssa, alu->src[0].swizzle[0]));
++   nir_scalar s1 = nir_scalar_chase_movs(nir_get_scalar(alu->src[1].src.ssa, alu->src[1].swizzle[0]));
++   if (nir_scalar_is_const(s1) && !nir_scalar_is_const(s0)) {
++      d->x = s0;
++      d->w = nir_scalar_as_uint(s1);
++   } else if (nir_scalar_is_const(s0) && !nir_scalar_is_const(s1)) {
++      d->x = s1;
++      d->w = nir_scalar_as_uint(s0);
++   } else {
++      return false;
++   }
++   d->alu = alu;
++   return true;
++}
++
++static bool
++same_x_sequence(const struct chain *a, const struct chain *b)
++{
++   if (a->len != b->len || a->dots[0].alu->op != b->dots[0].alu->op)
++      return false;
++   for (unsigned i = 0; i < a->len; i++) {
++      if (!nir_scalar_equal(a->dots[i].x, b->dots[i].x))
++         return false;
++   }
++   return true;
++}
++
++/* Index of the instruction that defines a scalar's value, in the block, or -1
++ * when it comes from before the block.
++ */
++static int
++def_index(nir_scalar s, nir_block *block, struct hash_table *index)
++{
++   nir_instr *instr = nir_def_instr(s.def);
++   if (instr->block != block)
++      return -1;
++   struct hash_entry *e = _mesa_hash_table_search(index, instr);
++   return e ? (int)(uintptr_t)e->data : -1;
++}
++
++/* Every use of a chain's result must come after the point where the DPAS
++ * group is inserted, or the group stays as dot products.
++ */
++static bool
++uses_after(nir_def *def, nir_block *block, struct hash_table *index, int point)
++{
++   nir_foreach_use_including_if(use, def) {
++      if (nir_src_is_if(use))
++         continue;
++      nir_instr *instr = nir_src_use_instr(use);
++      if (instr->block != block)
++         continue;   /* later blocks are dominated by this one */
++      struct hash_entry *e = _mesa_hash_table_search(index, instr);
++      if (!e || (int)(uintptr_t)e->data <= point)
++         return false;
++   }
++   return true;
++}
++
++/* The A operand of one DPAS, a[i][l] = component i in invocation l, as one
++ * subgroup block read of the shader's constant data. The backend reads the
++ * block read's registers in place (NoMask), so the operand is complete
++ * whichever invocations are active.
++ */
++static nir_def *
++load_a(nir_builder *b, nir_shader *nir, const uint32_t a[4][16])
++{
++   const unsigned offset = align(nir->constant_data_size, 64);
++   nir->constant_data = reralloc_size(nir, nir->constant_data, offset + 256);
++   memset((uint8_t *)nir->constant_data + nir->constant_data_size, 0,
++          offset - nir->constant_data_size);
++   memcpy((uint8_t *)nir->constant_data + offset, a, 256);
++   nir->constant_data_size = offset + 256;
++
++   nir_def *base = nir_pack_64_2x32_split(b,
++      nir_load_reloc_const_intel(b, INTEL_SHADER_RELOC_CONST_DATA_ADDR_LOW),
++      nir_load_reloc_const_intel(b, INTEL_SHADER_RELOC_CONST_DATA_ADDR_HIGH));
++   return nir_load_global_block_intel(b, 4, 32, nir_iadd_imm(b, base, offset),
++                                      .access = ACCESS_NON_WRITEABLE |
++                                                ACCESS_CAN_REORDER,
++                                      .align_mul = 64);
++}
++
++static bool
++lower_group(nir_builder *b, nir_shader *nir, struct chain **rows, unsigned nrows,
++            nir_instr *point)
++{
++   const unsigned K = rows[0]->len;
++   const bool is_signed = rows[0]->dots[0].alu->op == nir_op_sdot_4x8_iadd;
++
++   b->cursor = nir_after_instr(point);
++   nir_def *zero = nir_imm_int(b, 0);
++
++   for (unsigned r0 = 0; r0 < nrows; r0 += DPAS_ROWS) {
++      nir_def *acc[DPAS_ROWS];
++      for (unsigned r = 0; r < DPAS_ROWS; r++) {
++         acc[r] = r0 + r < nrows ?
++            nir_mov_scalar(b, rows[r0 + r]->init) : zero;
++      }
++
++      for (unsigned k0 = 0; k0 < K; k0 += DPAS_DEPTH) {
++         /* B: the invocation's own input dwords */
++         nir_def *x[DPAS_DEPTH];
++         for (unsigned k = 0; k < DPAS_DEPTH; k++) {
++            x[k] = k0 + k < K ? nir_mov_scalar(b, rows[0]->dots[k0 + k].x) : zero;
++         }
++
++         /* A: rows r0.., dwords k0.. of the weights. In SIMD16 component i of
++          * an int8 8x32 A (GRF i) holds, in invocation l, dword (l % 8) of row
++          * 2 * i + l / 8.
++          */
++         uint32_t a[4][16];
++         for (unsigned i = 0; i < 4; i++) {
++            for (unsigned l = 0; l < 16; l++) {
++               const unsigned r = r0 + 2 * i + l / 8, k = k0 + l % 8;
++               a[i][l] = (r < nrows && k < K) ? rows[r]->dots[k].w : 0;
++            }
++         }
++
++         nir_def *d = nir_dpas_intel(b, 32, nir_vec(b, acc, DPAS_ROWS),
++                                     nir_vec(b, x, DPAS_DEPTH),
++                                     load_a(b, nir, a),
++                                     .dest_base_type = is_signed ? GLSL_TYPE_INT : GLSL_TYPE_UINT,
++                                     .src_base_type = is_signed ? GLSL_TYPE_INT8 : GLSL_TYPE_UINT8,
++                                     .saturate = false,
++                                     .systolic_depth = DPAS_DEPTH,
++                                     .repeat_count = DPAS_ROWS);
++         for (unsigned r = 0; r < DPAS_ROWS; r++)
++            acc[r] = nir_channel(b, d, r);
++      }
++
++      for (unsigned r = 0; r < DPAS_ROWS && r0 + r < nrows; r++) {
++         struct chain *c = rows[r0 + r];
++         nir_def_rewrite_uses(&c->dots[c->len - 1].alu->def, acc[r]);
++      }
++   }
++   return true;
++}
++
++static bool
++lower_block(nir_builder *b, nir_shader *nir, nir_block *block)
++{
++   void *mem = ralloc_context(NULL);
++   struct hash_table *index = _mesa_pointer_hash_table_create(mem);
++   struct hash_table *dot_of = _mesa_pointer_hash_table_create(mem);
++   struct util_dynarray dots;
++   util_dynarray_init(&dots, mem);
++
++   unsigned n = 0;
++   nir_foreach_instr(instr, block) {
++      _mesa_hash_table_insert(index, instr, (void *)(uintptr_t)n++);
++      if (instr->type != nir_instr_type_alu)
++         continue;
++      struct dot d;
++      if (match_dot(nir_instr_as_alu(instr), &d)) {
++         d.index = n - 1;
++         util_dynarray_append(&dots, d);
++      }
++   }
++   if (util_dynarray_num_elements(&dots, struct dot) < 32) {
++      ralloc_free(mem);
++      return false;
++   }
++   util_dynarray_foreach(&dots, struct dot, d)
++      _mesa_hash_table_insert(dot_of, &d->alu->def, d);
++
++   /* Chains: follow the accumulator through dots of the same op whose result
++    * has no other use.
++    */
++   struct hash_table *continued = _mesa_pointer_hash_table_create(mem);
++   util_dynarray_foreach(&dots, struct dot, d) {
++      nir_def *acc = d->alu->src[2].src.ssa;
++      struct hash_entry *e = _mesa_hash_table_search(dot_of, acc);
++      if (e && ((struct dot *)e->data)->alu->op == d->alu->op &&
++          list_is_singular(&acc->uses) && d->alu->src[2].swizzle[0] == 0)
++         _mesa_hash_table_insert(continued, acc, d);
++   }
++
++   struct util_dynarray chains;
++   util_dynarray_init(&chains, mem);
++   util_dynarray_foreach(&dots, struct dot, d) {
++      nir_def *acc = d->alu->src[2].src.ssa;
++      if (_mesa_hash_table_search(continued, acc) &&
++          _mesa_hash_table_search(dot_of, acc))
++         continue;   /* not a head */
++
++      struct chain c = { .dots = NULL, .len = 0,
++                         .init = nir_get_scalar(acc, d->alu->src[2].swizzle[0]) };
++      struct util_dynarray list;
++      util_dynarray_init(&list, mem);
++      for (struct dot *cur = d; cur;) {
++         util_dynarray_append(&list, *cur);
++         struct hash_entry *e = _mesa_hash_table_search(continued, &cur->alu->def);
++         cur = e ? e->data : NULL;
++      }
++      c.dots = list.data;
++      c.len = util_dynarray_num_elements(&list, struct dot);
++      util_dynarray_append(&chains, c);
++   }
++
++   bool progress = false;
++   const unsigned nchains = util_dynarray_num_elements(&chains, struct chain);
++   struct chain *all = chains.data;
++   struct chain **rows = ralloc_array(mem, struct chain *, nchains);
++
++   for (unsigned i = 0; i < nchains; i++) {
++      if (all[i].grouped)
++         continue;
++      unsigned nrows = 0;
++      for (unsigned j = i; j < nchains; j++) {
++         if (!all[j].grouped && same_x_sequence(&all[i], &all[j])) {
++            rows[nrows++] = &all[j];
++            all[j].grouped = true;
++         }
++      }
++      if (nrows * rows[0]->len < 32)
++         continue;
++
++      /* Insert after the last instruction any of the group's operands (inputs,
++       * initial accumulators) or dots needs; all results must be used later.
++       */
++      int point = -1;
++      nir_instr *point_instr = NULL;
++      for (unsigned r = 0; r < nrows; r++) {
++         for (unsigned k = 0; k < rows[r]->len; k++) {
++            if ((int)rows[r]->dots[k].index > point) {
++               point = rows[r]->dots[k].index;
++               point_instr = &rows[r]->dots[k].alu->instr;
++            }
++         }
++      }
++      bool ok = point_instr != NULL;
++      for (unsigned r = 0; ok && r < nrows; r++) {
++         struct chain *c = rows[r];
++         ok = def_index(c->init, block, index) < point &&
++              uses_after(&c->dots[c->len - 1].alu->def, block, index, point);
++      }
++      if (!ok)
++         continue;
++
++      progress |= lower_group(b, nir, rows, nrows, point_instr);
++   }
++
++   ralloc_free(mem);
++   return progress;
++}
++
++/* DPAS writes its destination in every invocation (NoMask), while registers
++ * are allocated on the logical CFG: in non-uniform control flow that could
++ * clobber a value the inactive invocations still need. That cannot happen
++ * outside loops when every non-uniform if around the block has nothing on
++ * the other side (the bounds check `if (in bounds) { ... }`): a value live in
++ * the inactive invocations is then live after the if, so through the block.
++ */
++static bool
++dpas_safe_in(nir_block *block)
++{
++   if (!block->divergent)
++      return true;
++
++   nir_cf_node *child = &block->cf_node;
++   for (nir_cf_node *n = child->parent; n->type != nir_cf_node_function;
++        child = n, n = n->parent) {
++      if (n->type == nir_cf_node_loop)
++         return false;
++      if (n->type != nir_cf_node_if)
++         continue;
++
++      nir_if *nif = nir_cf_node_as_if(n);
++      if (!nir_src_is_divergent(&nif->condition))
++         continue;
++
++      bool in_then = false;
++      foreach_list_typed(nir_cf_node, c, node, &nif->then_list)
++         in_then |= c == child;
++
++      struct exec_list *other = in_then ? &nif->else_list : &nif->then_list;
++      nir_block *only = nir_cf_node_as_block(exec_node_data(nir_cf_node,
++                                             exec_list_get_head(other), node));
++      if (!exec_list_is_singular(other) || !exec_list_is_empty(&only->instr_list))
++         return false;
++   }
++   return true;
++}
++
++static bool
++observes_subgroup_size_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   static const char *const ops[] = {
++      "subgroup_size", "ballot", "vote", "shuffle", "reduce", "scan", "quad_",
++      "read_invocation", "first_invocation", "last_invocation", "elect",
++      "rotate", "swizzle", "_mask", "dpas", "cmat",
++   };
++   const char *name = nir_intrinsic_infos[intr->intrinsic].name;
++   if (strstr(name, "subgroup_") && !strstr(name, "subgroup_invocation") &&
++       !strstr(name, "subgroup_id") && !strstr(name, "num_subgroups"))
++      return true;
++   for (unsigned i = 0; i < ARRAY_SIZE(ops); i++) {
++      if (strstr(name, ops[i]))
++         return true;
++   }
++   return false;
++}
++
++/* Whether the shader can tell its subgroup size: subgroup operations, the size
++ * itself, the subgroup masks, cooperative matrices.
++ */
++static bool
++observes_subgroup_size(nir_shader *nir)
++{
++   return nir->info.uses_wide_subgroup_intrinsics ||
++          nir_shader_intrinsics_pass(nir, observes_subgroup_size_instr,
++                                     nir_metadata_all, NULL);
++}
++
++bool
++jay_nir_dot4_to_dpas(nir_shader *nir, const struct intel_device_info *devinfo)
++{
++   if (devinfo->ver < 20 || nir->info.stage != MESA_SHADER_COMPUTE ||
++       !debug_get_bool_option("INTEL_DOT4_DPAS", true))
++      return false;
++
++   /* SIMD16 only: leave shaders that require another subgroup size, unless
++    * nothing in them can observe it. SPIR-V before 1.6 gets the API subgroup
++    * size (32) by default, required with full subgroups.
++    */
++   const bool observable = observes_subgroup_size(nir);
++   if (observable &&
++       ((nir->info.min_subgroup_size && nir->info.min_subgroup_size > 16) ||
++        (nir->info.max_subgroup_size && nir->info.max_subgroup_size < 16) ||
++        (nir->info.api_subgroup_size && nir->info.api_subgroup_size != 16)))
++      return false;
++
++   bool progress = false;
++   nir_foreach_function_impl(impl, nir) {
++      nir_builder b = nir_builder_create(impl);
++      bool p = false;
++      nir_metadata_require(impl, nir_metadata_divergence);
++      nir_foreach_block(block, impl) {
++         if (dpas_safe_in(block))
++            p |= lower_block(&b, nir, block);
++      }
++      progress |= nir_progress(p, impl, nir_metadata_control_flow);
++   }
++
++   if (progress) {
++      nir->info.min_subgroup_size = 16;
++      nir->info.max_subgroup_size = 16;
++      if (!observable)
++         nir->info.api_subgroup_size = 16;
++   }
++   return progress;
++}
+diff --git a/src/intel/compiler/jay/jay_private.h b/src/intel/compiler/jay/jay_private.h
+index 5415830a65a..d4a94596308 100644
+--- a/src/intel/compiler/jay/jay_private.h
++++ b/src/intel/compiler/jay/jay_private.h
+@@ -31,6 +31,8 @@ struct jay_fs_perprim_data {
+ bool jay_nir_lower_bool(nir_shader *nir);
+ bool jay_nir_lower_fsign(nir_shader *nir, unsigned verx10);
+ bool jay_nir_lower_bfloat_math(nir_shader *nir);
++bool jay_nir_dot4_to_dpas(nir_shader *nir,
++                          const struct intel_device_info *devinfo);
+ 
+ void jay_populate_prog_data(const struct intel_device_info *devinfo,
+                             nir_shader *nir,
+diff --git a/src/intel/compiler/jay/meson.build b/src/intel/compiler/jay/meson.build
+index 51b8514c20a..9edd482a20e 100644
+--- a/src/intel/compiler/jay/meson.build
++++ b/src/intel/compiler/jay/meson.build
+@@ -59,6 +59,7 @@ libintel_compiler_jay_files = files(
+   'jay_lower_scoreboard.c',
+   'jay_lower_spill.c',
+   'jay_nir.c',
++  'jay_nir_dot4_to_dpas.c',
+   'jay_opt_dead_code.c',
+   'jay_opt_postra_vectorize.c',
+   'jay_opt_predicate.c',

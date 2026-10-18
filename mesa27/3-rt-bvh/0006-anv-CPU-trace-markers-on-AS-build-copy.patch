@@ -1,0 +1,39 @@
+From 1a205e03c328b12115834347aa3658fb816efda0 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 16:47:30 -0300
+Subject: [PATCH 06/21] anv: CPU trace markers on AS build/copy
+
+(cherry picked from commit 46226e80401c13717dbd48deab1ae044c5e98f50)
+(cherry picked from commit bb55c9f0168f376f0a1e4c9516fa49b63507cd98)
+---
+ src/intel/vulkan/genX_acceleration_structure.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/intel/vulkan/genX_acceleration_structure.c b/src/intel/vulkan/genX_acceleration_structure.c
+index 18f8a94b342..b6f6c35fc11 100644
+--- a/src/intel/vulkan/genX_acceleration_structure.c
++++ b/src/intel/vulkan/genX_acceleration_structure.c
+@@ -9,6 +9,7 @@
+ #include "util/u_debug.h"
+ #include "util/half_float.h"
+ #include "util/u_atomic.h"
++#include "util/perf/cpu_trace.h"
+ 
+ #include "genxml/gen_macros.h"
+ #include "genxml/genX_pack.h"
+@@ -1139,6 +1140,7 @@ genX(CmdBuildAccelerationStructuresKHR)(
+     const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
+     const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos)
+ {
++   MESA_TRACE_FUNC();
+    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+ 
+    struct anv_device *device = cmd_buffer->device;
+@@ -1178,6 +1180,7 @@ genX(CmdCopyAccelerationStructureKHR)(
+     VkCommandBuffer                             commandBuffer,
+     const VkCopyAccelerationStructureInfoKHR*   pInfo)
+ {
++   MESA_TRACE_FUNC();
+    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+    VK_FROM_HANDLE(vk_acceleration_structure, src, pInfo->src);
+    VK_FROM_HANDLE(vk_acceleration_structure, dst, pInfo->dst);

@@ -1,0 +1,344 @@
+From eafff5a2aecb71b0a0f2ebca240254ed091f5099 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 15:38:42 -0300
+Subject: [PATCH 01/21] anv/bvh: batch update/header dispatches; fix OOB shared
+ store of update transform
+
+(cherry picked from commit 4e7350cafd9980a0334055c8ff6b6f9023340a91)
+(cherry picked from commit 579e38cec137447ac865f05a29fe7de2c98745f5)
+---
+ src/intel/vulkan/bvh/anv_bvh_defines.h        |  29 +++-
+ src/intel/vulkan/bvh/header.comp              |   6 +-
+ src/intel/vulkan/bvh/update.comp              |  35 ++++-
+ .../vulkan/genX_acceleration_structure.c      | 138 +++++++++++++++---
+ 4 files changed, 179 insertions(+), 29 deletions(-)
+
+diff --git a/src/intel/vulkan/bvh/anv_bvh_defines.h b/src/intel/vulkan/bvh/anv_bvh_defines.h
+index ecdd26653fd..c15d84b8bf6 100644
+--- a/src/intel/vulkan/bvh/anv_bvh_defines.h
++++ b/src/intel/vulkan/bvh/anv_bvh_defines.h
+@@ -395,6 +395,20 @@ struct update_args {
+    vk_bvh_geometry_data geom_data;
+ };
+ 
++#ifdef VULKAN
++TYPE(update_args, 8);
++#endif
++
++/* All geometries of all updated BLAS go in one dispatch: geometry i owns
++ * workgroups [wg_start[i], wg_start[i + 1]), found by binary search.
++ */
++struct update_batch_args {
++   REF(update_args) args;
++   REF(uint32_t) wg_start;
++   uint32_t geometry_count;
++   uint32_t wg_base;
++};
++
+ #define ANV_ENCODE_BUILD_FLAGS (VK_BUILD_FLAG_HAS_QUADS | ANV_BUILD_FLAG_WRITE_LOOKUP_MAPS_FOR_UPDATE)
+ 
+ struct anv_batch_args {
+@@ -439,7 +453,20 @@ struct header_args {
+    uint32_t instance_leaves_offset;
+ 
+    uint64_t bvh_size;
+-   uint8_t is_compacted;
++   /* 32-bit + pad so the C and scalar GLSL layouts agree (48 bytes), the
++    * structs are read as an array by header.comp.
++    */
++   uint32_t is_compacted;
++   uint32_t pad;
++};
++
++#ifdef VULKAN
++TYPE(header_args, 8);
++#endif
++
++/* One workgroup per BLAS, reading header_args[gl_WorkGroupID.x]. */
++struct header_batch_args {
++   REF(header_args) args;
+ };
+ 
+ #define ANV_COPY_MODE_COPY        0
+diff --git a/src/intel/vulkan/bvh/header.comp b/src/intel/vulkan/bvh/header.comp
+index 0e462e86b99..b5a5a92a8b7 100644
+--- a/src/intel/vulkan/bvh/header.comp
++++ b/src/intel/vulkan/bvh/header.comp
+@@ -13,14 +13,16 @@ layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout(push_constant) uniform CONSTS
+ {
+-   header_args args;
++   header_batch_args batch;
+ };
+ 
+ void
+ main(void)
+ {
++   header_args args = DEREF(INDEX(header_args, batch.args, gl_WorkGroupID.x));
++
+    uint64_t compacted_size = args.bvh_size;
+-   if (args.is_compacted == uint8_t(1)) {
++   if (args.is_compacted == 1) {
+       compacted_size =
+          args.bvh_offset + DEREF(args.src).dst_node_offset * ANV_RT_BLOCK_SIZE;
+    }
+diff --git a/src/intel/vulkan/bvh/update.comp b/src/intel/vulkan/bvh/update.comp
+index be744c56cbe..81a88407a16 100644
+--- a/src/intel/vulkan/bvh/update.comp
++++ b/src/intel/vulkan/bvh/update.comp
+@@ -32,9 +32,32 @@
+ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout(push_constant) uniform CONSTS {
+-   update_args args;
++   update_batch_args batch;
+ };
+ 
++/* Arguments of the geometry this workgroup belongs to, see main(). */
++update_args args;
++uint32_t local_wg_id;
++
++void
++load_batch_args()
++{
++   uint32_t wg = batch.wg_base + gl_WorkGroupID.x;
++
++   /* Largest i with wg_start[i] <= wg. */
++   uint32_t lo = 0, hi = batch.geometry_count - 1;
++   while (lo < hi) {
++      uint32_t mid = (lo + hi + 1) / 2;
++      if (DEREF(INDEX(uint32_t, batch.wg_start, mid)) <= wg)
++         lo = mid;
++      else
++         hi = mid - 1;
++   }
++
++   args = DEREF(INDEX(update_args, batch.args, lo));
++   local_wg_id = wg - DEREF(INDEX(uint32_t, batch.wg_start, lo));
++}
++
+ shared mat4 update_transform;
+ 
+ vk_ir_triangle_node
+@@ -302,7 +325,13 @@ get_child_index(uint32_t parent_raw)
+ 
+ void main()
+ {
+-   if (args.geom_data.transform != NULL) {
++   load_batch_args();
++
++   /* Only the first 16 invocations fill the 4x4 matrix: with the whole
++    * workgroup storing, rows 4..63 indexed past the end of update_transform
++    * and corrupted the shared memory of neighbouring workgroups.
++    */
++   if (args.geom_data.transform != NULL && gl_LocalInvocationIndex < 16) {
+       uint32_t col = gl_LocalInvocationIndex % 4;
+       uint32_t row = gl_LocalInvocationIndex / 4;
+ 
+@@ -313,7 +342,7 @@ void main()
+    }
+    barrier();
+ 
+-   uint32_t leaf_local = gl_GlobalInvocationID.x;
++   uint32_t leaf_local = local_wg_id * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (leaf_local >= args.leaf_node_count || leaf_local >= args.primitive_count)
+       return;
+ 
+diff --git a/src/intel/vulkan/genX_acceleration_structure.c b/src/intel/vulkan/genX_acceleration_structure.c
+index 39e5ce3e6c3..ec75c7c3e4f 100644
+--- a/src/intel/vulkan/genX_acceleration_structure.c
++++ b/src/intel/vulkan/genX_acceleration_structure.c
+@@ -641,9 +641,31 @@ anv_init_header(VkCommandBuffer commandBuffer, struct vk_device *vk_device, stru
+ 
+    trace_intel_begin_as_init_header(&cmd_buffer->trace);
+ 
++   uint32_t header_count = 0;
++   for (uint32_t i = 0; i < build_count; i++) {
++      if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
++         header_count++;
++   }
++   if (header_count == 0) {
++      trace_intel_end_as_init_header(&cmd_buffer->trace, build_flags);
++      return VK_SUCCESS;
++   }
++
++   /* All headers in one dispatch, one workgroup per AS. */
++   struct anv_cmd_alloc alloc =
++      anv_cmd_buffer_alloc_space(cmd_buffer,
++                                 header_count * sizeof(struct header_args),
++                                 64, true);
++   if (alloc.map == NULL) {
++      return vk_errorf(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "Failed to allocate AS header batch");
++   }
++   struct header_args *header_batch = alloc.map;
++
+    anv_bvh_build_bind_pipeline(commandBuffer, ANV_OBJECT_KEY_BVH_HEADER, header_spv, sizeof(header_spv),
+-                               sizeof(struct header_args), 0);
++                               sizeof(struct header_batch_args), 0);
+ 
++   uint32_t h = 0;
+    for (uint32_t i = 0; i < build_count; i++) {
+       struct vk_acceleration_structure_build_state *state = &states[i];
+       if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+@@ -652,15 +674,12 @@ anv_init_header(VkCommandBuffer commandBuffer, struct vk_device *vk_device, stru
+       VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
+ 
+       uint64_t intermediate_header_addr = state->build_info->scratchData.deviceAddress + state->scratch.header_offset;
+-      uint64_t intermediate_bvh_addr = state->build_info->scratchData.deviceAddress + state->scratch.ir_offset;
+ 
+       VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(state->build_info);
+ 
+       struct bvh_layout bvh_layout;
+       get_bvh_layout(state, &bvh_layout);
+ 
+-      VkDeviceAddress header_addr = vk_acceleration_structure_get_va(dst);
+-
+       uint32_t instance_count = geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR ?
+                                 state->leaf_node_count : 0;
+ 
+@@ -686,15 +705,32 @@ anv_init_header(VkCommandBuffer commandBuffer, struct vk_device *vk_device, stru
+          !(state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR))
+          args.is_compacted = true;
+ 
+-      anv_bvh_build_set_args(commandBuffer, &args, sizeof(args));
+-      vk_common_CmdDispatch(commandBuffer, 1, 1, 1);
++      header_batch[h++] = args;
++   }
+ 
+-      if (INTEL_DEBUG_BVH_ANY) {
+-         debug_record_as_to_bvh_dump(cmd_buffer, header_addr, bvh_layout,
+-                                     intermediate_header_addr, intermediate_bvh_addr,
+-                                     state->leaf_node_count, geometry_type,
+-                                     false /* after update */);
+-      }
++   const struct header_batch_args batch_args = {
++      .args = anv_address_physical(alloc.address),
++   };
++   anv_bvh_build_set_args(commandBuffer, &batch_args, sizeof(batch_args));
++   vk_common_CmdDispatch(commandBuffer, header_count, 1, 1);
++
++   for (uint32_t i = 0; INTEL_DEBUG_BVH_ANY && i < build_count; i++) {
++      struct vk_acceleration_structure_build_state *state = &states[i];
++      if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
++         continue;
++
++      VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
++      uint64_t intermediate_header_addr = state->build_info->scratchData.deviceAddress + state->scratch.header_offset;
++      uint64_t intermediate_bvh_addr = state->build_info->scratchData.deviceAddress + state->scratch.ir_offset;
++      VkGeometryTypeKHR geometry_type = vk_get_as_geometry_type(state->build_info);
++      struct bvh_layout bvh_layout;
++      get_bvh_layout(state, &bvh_layout);
++      VkDeviceAddress header_addr = vk_acceleration_structure_get_va(dst);
++
++      debug_record_as_to_bvh_dump(cmd_buffer, header_addr, bvh_layout,
++                                  intermediate_header_addr, intermediate_bvh_addr,
++                                  state->leaf_node_count, geometry_type,
++                                  false /* after update */);
+    }
+ 
+    trace_intel_end_as_init_header(&cmd_buffer->trace, build_flags);
+@@ -773,7 +809,7 @@ anv_update_as(VkCommandBuffer commandBuffer, struct vk_device *vk_device,
+ 
+    anv_bvh_build_bind_pipeline(commandBuffer, ANV_OBJECT_KEY_BVH_UPDATE,
+                                update_spv, sizeof(update_spv),
+-                               sizeof(struct update_args), build_flags);
++                               sizeof(struct update_batch_args), build_flags);
+ 
+    bool barrier_needed = false;
+    for (uint32_t i = 0; i < build_count; i++) {
+@@ -805,6 +841,36 @@ anv_update_as(VkCommandBuffer commandBuffer, struct vk_device *vk_device,
+    if (barrier_needed)
+       vk_bvh_build_barrier_transfer_to_compute(commandBuffer);
+ 
++   /* Every geometry of every updated AS goes in a single dispatch instead of
++    * one tiny dispatch per geometry: games refit 100+ skinned BLAS per frame,
++    * most with a handful of workgroups, and the per-dispatch cost dominated.
++    * Workgroups of different geometries were already unordered (no barrier
++    * between the old dispatches), so this doesn't change synchronization.
++    */
++   uint32_t geometry_count = 0;
++   for (uint32_t i = 0; i < build_count; i++) {
++      if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
++         geometry_count += states[i].build_info->geometryCount;
++   }
++   if (geometry_count == 0) {
++      trace_intel_end_as_update(&cmd_buffer->trace, build_flags);
++      return VK_SUCCESS;
++   }
++
++   const uint32_t update_wg_size = 256; /* local_size_x of update.comp */
++   uint32_t args_size = align(geometry_count * sizeof(struct update_args), 64);
++   struct anv_cmd_alloc alloc =
++      anv_cmd_buffer_alloc_space(cmd_buffer,
++                                 args_size + geometry_count * sizeof(uint32_t),
++                                 64, true);
++   if (alloc.map == NULL) {
++      return vk_errorf(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY,
++                       "Failed to allocate AS update batch");
++   }
++   struct update_args *update_batch = alloc.map;
++   uint32_t *wg_start = (uint32_t *)((char *)alloc.map + args_size);
++   uint32_t g = 0, total_wgs = 0;
++
+    for (uint32_t i = 0; i < build_count; i++) {
+       struct vk_acceleration_structure_build_state *state = &states[i];
+       if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
+@@ -848,20 +914,46 @@ anv_update_as(VkCommandBuffer commandBuffer, struct vk_device *vk_device,
+          update_consts.geom_data = vk_fill_geometry_data(state->build_info->type, first_id, j, geom, build_range_info);
+          update_consts.primitive_count = build_range_info->primitiveCount;
+ 
+-         anv_bvh_build_set_args(commandBuffer, &update_consts, sizeof(update_consts));
+-         anv_genX(cmd_buffer->device->info, cmd_dispatch_unaligned)
+-            (commandBuffer, build_range_info->primitiveCount, 1, 1);
++         /* An empty geometry still gets an entry (so the binary search stays
++          * simple) but owns no workgroup.
++          */
++         update_batch[g] = update_consts;
++         wg_start[g] = total_wgs;
++         total_wgs += DIV_ROUND_UP(build_range_info->primitiveCount, update_wg_size);
++         g++;
+ 
+          first_id += build_range_info->primitiveCount;
+       }
++   }
++   assert(g == geometry_count);
++
++   uint64_t args_addr = anv_address_physical(alloc.address);
++   const uint32_t max_wgs = 65535;
++   for (uint32_t base = 0; base < total_wgs; base += max_wgs) {
++      const struct update_batch_args batch_args = {
++         .args = args_addr,
++         .wg_start = args_addr + args_size,
++         .geometry_count = geometry_count,
++         .wg_base = base,
++      };
++      anv_bvh_build_set_args(commandBuffer, &batch_args, sizeof(batch_args));
++      vk_common_CmdDispatch(commandBuffer, MIN2(total_wgs - base, max_wgs), 1, 1);
++   }
+ 
+-      if (INTEL_DEBUG_BVH_ANY) {
+-         debug_record_as_to_bvh_dump(cmd_buffer, vk_acceleration_structure_get_va(dst),
+-                                     bvh_layout, 0, 0,
+-                                     state->leaf_node_count,
+-                                     vk_get_as_geometry_type(state->build_info),
+-                                     true /* after update */);
+-      }
++   for (uint32_t i = 0; INTEL_DEBUG_BVH_ANY && i < build_count; i++) {
++      struct vk_acceleration_structure_build_state *state = &states[i];
++      if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
++         continue;
++
++      VK_FROM_HANDLE(vk_acceleration_structure, dst, state->build_info->dstAccelerationStructure);
++      struct bvh_layout bvh_layout;
++      get_bvh_layout(state, &bvh_layout);
++
++      debug_record_as_to_bvh_dump(cmd_buffer, vk_acceleration_structure_get_va(dst),
++                                  bvh_layout, 0, 0,
++                                  state->leaf_node_count,
++                                  vk_get_as_geometry_type(state->build_info),
++                                  true /* after update */);
+    }
+ 
+    trace_intel_end_as_update(&cmd_buffer->trace, build_flags);

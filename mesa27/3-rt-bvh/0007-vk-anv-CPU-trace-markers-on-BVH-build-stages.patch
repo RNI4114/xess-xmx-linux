@@ -1,0 +1,141 @@
+From 3e564c33823b3bce618aae25bbec13c7ae473a87 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 16:49:34 -0300
+Subject: [PATCH 07/21] vk/anv: CPU trace markers on BVH build stages
+
+(cherry picked from commit 4f72c2f904a84066a9a3264e1ebef8299cbd36ce)
+(cherry picked from commit 5a8c60605ae2d2a97d05b2df4a70c7911a762cfc)
+---
+ src/intel/vulkan/genX_acceleration_structure.c |  5 +++++
+ src/vulkan/runtime/vk_acceleration_structure.c | 11 +++++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/src/intel/vulkan/genX_acceleration_structure.c b/src/intel/vulkan/genX_acceleration_structure.c
+index b6f6c35fc11..8d8482bee3f 100644
+--- a/src/intel/vulkan/genX_acceleration_structure.c
++++ b/src/intel/vulkan/genX_acceleration_structure.c
+@@ -620,6 +620,7 @@ anv_encode_as(VkCommandBuffer commandBuffer, struct vk_device *vk_device, struct
+               const struct vk_acceleration_structure_build_args *args, struct vk_acceleration_structure_build_state *states,
+               uint32_t build_count, uint32_t build_flags)
+ {
++   MESA_TRACE_FUNC();
+    VK_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+    trace_intel_begin_as_encode(&cmd_buffer->trace);
+ 
+@@ -685,6 +686,7 @@ anv_init_header(VkCommandBuffer commandBuffer, struct vk_device *vk_device, stru
+                 const struct vk_acceleration_structure_build_args *args, struct vk_acceleration_structure_build_state *states,
+                 uint32_t build_count, uint32_t build_flags)
+ {
++   MESA_TRACE_FUNC();
+    VK_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+ 
+    trace_intel_begin_as_init_header(&cmd_buffer->trace);
+@@ -822,6 +824,7 @@ anv_init_update_scratch(VkCommandBuffer commandBuffer,
+                         const struct vk_acceleration_structure_build_state *states,
+                         uint32_t build_count)
+ {
++   MESA_TRACE_FUNC();
+    VK_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+    struct anv_device *device = cmd_buffer->device;
+ 
+@@ -850,6 +853,7 @@ anv_update_as(VkCommandBuffer commandBuffer, struct vk_device *vk_device,
+               struct vk_acceleration_structure_build_state *states,
+               uint32_t build_count, uint32_t build_flags)
+ {
++   MESA_TRACE_FUNC();
+    VK_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+    struct anv_device *device = cmd_buffer->device;
+ 
+@@ -1014,6 +1018,7 @@ anv_encode(VkCommandBuffer commandBuffer, struct vk_device *device, struct vk_me
+            const struct vk_acceleration_structure_build_args *args, struct vk_acceleration_structure_build_state *states,
+            uint32_t build_count, bool flushed_compute_after_init_update_scratch)
+ {
++   MESA_TRACE_FUNC();
+    bool has_build = false;
+    bool has_update = false;
+    bool flushed_compute = false;
+diff --git a/src/vulkan/runtime/vk_acceleration_structure.c b/src/vulkan/runtime/vk_acceleration_structure.c
+index 31d013d7845..6df72b2ff82 100644
+--- a/src/vulkan/runtime/vk_acceleration_structure.c
++++ b/src/vulkan/runtime/vk_acceleration_structure.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "vk_acceleration_structure.h"
++#include "util/perf/cpu_trace.h"
+ 
+ #include "vk_alloc.h"
+ #include "vk_common_entrypoints.h"
+@@ -622,6 +623,7 @@ build_leaves(VkCommandBuffer commandBuffer, struct vk_device *device,
+              struct vk_acceleration_structure_build_state *states,
+              uint32_t build_count, uint32_t build_flags)
+ {
++   MESA_TRACE_FUNC();
+    VkPipeline pipeline;
+    VkPipelineLayout layout;
+ 
+@@ -714,6 +716,7 @@ morton_generate(VkCommandBuffer commandBuffer, struct vk_device *device,
+                 struct vk_acceleration_structure_build_state *states,
+                 uint32_t build_count, uint32_t build_flags)
+ {
++   MESA_TRACE_FUNC();
+    VkPipeline pipeline;
+    VkPipelineLayout layout;
+ 
+@@ -790,6 +793,7 @@ pair_triangles(VkCommandBuffer commandBuffer, struct vk_device *device,
+                struct vk_acceleration_structure_build_state *states,
+                uint32_t build_count, uint32_t build_flags)
+ {
++   MESA_TRACE_FUNC();
+    VkPipeline pipeline;
+    VkPipelineLayout layout;
+ 
+@@ -864,6 +868,7 @@ id_prefix_sum(VkCommandBuffer commandBuffer, struct vk_device *device,
+               struct vk_acceleration_structure_build_state *states,
+               uint32_t build_count, uint32_t build_flags)
+ {
++   MESA_TRACE_FUNC();
+    VkPipeline pipeline;
+    VkPipelineLayout layout;
+ 
+@@ -1058,6 +1063,7 @@ ploc_build_internal(VkCommandBuffer commandBuffer, struct vk_device *device,
+                     struct vk_acceleration_structure_build_state *states,
+                     uint32_t build_count, uint32_t build_flags)
+ {
++   MESA_TRACE_FUNC();
+    VkPipeline pipeline;
+    VkPipelineLayout layout;
+ 
+@@ -1126,6 +1132,7 @@ hploc_build_internal(VkCommandBuffer commandBuffer, struct vk_device *device,
+                      struct vk_acceleration_structure_build_state *states,
+                      uint32_t build_count, uint32_t build_flags)
+ {
++   MESA_TRACE_FUNC();
+    VkPipeline pipeline;
+    VkPipelineLayout layout;
+ 
+@@ -1220,6 +1227,7 @@ vk_cmd_build_acceleration_structures(VkCommandBuffer commandBuffer,
+                                      const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos,
+                                      const struct vk_acceleration_structure_build_args *args)
+ {
++   MESA_TRACE_FUNC();
+    VK_FROM_HANDLE(vk_command_buffer, cmd_buffer, commandBuffer);
+    const struct vk_acceleration_structure_build_ops *ops = device->as_build_ops;
+ 
+@@ -1327,6 +1335,8 @@ vk_cmd_build_acceleration_structures(VkCommandBuffer commandBuffer,
+          return;
+       }
+ 
++      {
++      MESA_TRACE_SCOPE("vk_as_build_fill_scratch");
+       for (uint32_t i = 0; i < infoCount; ++i) {
+          if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE) {
+             device->cmd_fill_buffer_addr(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.sort_internal_offset,
+@@ -1339,6 +1349,7 @@ vk_cmd_build_acceleration_structures(VkCommandBuffer commandBuffer,
+          }
+       }
+ 
++      }
+       vk_bvh_build_barrier_transfer_to_compute(commandBuffer);
+       vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+ 

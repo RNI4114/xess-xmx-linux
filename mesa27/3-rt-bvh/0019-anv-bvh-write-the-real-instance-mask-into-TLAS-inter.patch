@@ -1,0 +1,74 @@
+From 6a5c02d4af6afe74b5f7624d61ccbf582e6f5294 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:02:26 -0300
+Subject: [PATCH 19/21] anv/bvh: write the real instance mask into TLAS
+ internal nodes
+
+OR of the instance masks below each node instead of 0xff, so cull
+masks prune subtrees (TLAS is never refit on ANV).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 07ece8b07b7eaaab0708cc2bd877b55c5e0e3f76)
+---
+ src/intel/vulkan/bvh/encode.comp        | 11 ++++++++++-
+ src/intel/vulkan/bvh/encode_fenced.comp | 11 ++++++++++-
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/src/intel/vulkan/bvh/encode.comp b/src/intel/vulkan/bvh/encode.comp
+index 78b79288bde..a135b30216a 100644
+--- a/src/intel/vulkan/bvh/encode.comp
++++ b/src/intel/vulkan/bvh/encode.comp
+@@ -207,6 +207,15 @@ encode_internal_node(uint32_t child, uint32_t child_block_offset_from_internal_n
+ 
+       uint8_t node_type = determine_internal_node_type(cluster, child, child_count);
+ 
++      /* The IR keeps the inverted instance masks ANDed up the tree (propagate_cull_flags), so the OR
++       * of the instance masks under this node is the inverse of the AND over its children. Only a
++       * TLAS has masks (BLAS flags carry none, which gives 0xff), and a TLAS is never refit. With a
++       * real mask the traversal skips subtrees no instance of which the ray's cull mask accepts,
++       * instead of descending to every instance leaf to reject it there. */
++      uint32_t inv_cull_mask =
++         subgroupClusteredAnd(fetch_child_flags(args.intermediate_bvh, child), 8) >>
++         VK_BVH_BOX_FLAGS_INV_CULL_MASK_SHIFT;
++
+       if (cluster.idx == 0) {
+          DEREF(dst_node).child_block_offset = child_block_offset_from_internal_node;
+          DEREF(dst_node).lower[0] = conservative_child_aabb.min.x;
+@@ -215,7 +224,7 @@ encode_internal_node(uint32_t child, uint32_t child_block_offset_from_internal_n
+          DEREF(dst_node).exp_x = exp_i8[0];
+          DEREF(dst_node).exp_y = exp_i8[1];
+          DEREF(dst_node).exp_z = exp_i8[2];
+-         DEREF(dst_node).node_mask = uint8_t(0xff);
++         DEREF(dst_node).node_mask = uint8_t(~inv_cull_mask & 0xff);
+          DEREF(dst_node).node_type = node_type;
+          DEREF(dst_node).pad = uint8_t(0);
+ 
+diff --git a/src/intel/vulkan/bvh/encode_fenced.comp b/src/intel/vulkan/bvh/encode_fenced.comp
+index 2a48ba79f95..63b6f813c00 100644
+--- a/src/intel/vulkan/bvh/encode_fenced.comp
++++ b/src/intel/vulkan/bvh/encode_fenced.comp
+@@ -193,6 +193,15 @@ encode_internal_node(uint32_t child, uint32_t child_block_offset_from_internal_n
+ 
+       uint8_t node_type = determine_internal_node_type(cluster, child, child_count);
+ 
++      /* The IR keeps the inverted instance masks ANDed up the tree (propagate_cull_flags), so the OR
++       * of the instance masks under this node is the inverse of the AND over its children. Only a
++       * TLAS has masks (BLAS flags carry none, which gives 0xff), and a TLAS is never refit. With a
++       * real mask the traversal skips subtrees no instance of which the ray's cull mask accepts,
++       * instead of descending to every instance leaf to reject it there. */
++      uint32_t inv_cull_mask =
++         subgroupClusteredAnd(fetch_child_flags(args.intermediate_bvh, child), 8) >>
++         VK_BVH_BOX_FLAGS_INV_CULL_MASK_SHIFT;
++
+       if (cluster.idx == 0) {
+          DEREF(dst_node).child_block_offset = child_block_offset_from_internal_node;
+          DEREF(dst_node).lower[0] = conservative_child_aabb.min.x;
+@@ -201,7 +210,7 @@ encode_internal_node(uint32_t child, uint32_t child_block_offset_from_internal_n
+          DEREF(dst_node).exp_x = exp_i8[0];
+          DEREF(dst_node).exp_y = exp_i8[1];
+          DEREF(dst_node).exp_z = exp_i8[2];
+-         DEREF(dst_node).node_mask = uint8_t(0xff);
++         DEREF(dst_node).node_mask = uint8_t(~inv_cull_mask & 0xff);
+          DEREF(dst_node).node_type = node_type;
+          DEREF(dst_node).pad = uint8_t(0);
+ 

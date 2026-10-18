@@ -118,6 +118,11 @@ The full table, the logs and every switch: [docs/debugging.md](docs/debugging.md
 [docs/how-it-works.md](docs/how-it-works.md): the shim, the placeholders, run-time compilation, which kernel variant
 XeSS picks (and why `SIMD16Required` matters), frame generation, XeLL.
 
+## FSR4
+
+AMD's FSR4 runs on Xe2's XMX units too, with a Mesa 27 driver built from `mesa27/` and a few Proton-side pieces in
+`fsr4/`: see [docs/fsr4.md](docs/fsr4.md). None of it is needed for XeSS.
+
 ## Repository
 
     install.sh, uninstall.sh      system-wide install / removal
@@ -136,7 +141,11 @@ XeSS picks (and why `SIMD16Required` matters), frame generation, XeLL.
     tools/gen_dyn_dummies.py      placeholder table for run-time kernels;  tools/check_dyn_ids.py consistency check
     tools/split_patch.py          writes patches 0001 / 0002 from the marked source tree
     tools/gen_all_dummies.py, s16_map.py, build-kernels.sh, kernel_map_*.txt   optional static kernel set
-    docs/                         how it works, building, debugging, games
+    mesa27/                       Mesa main (27) for this package plus FSR4 on XMX, as parts on top of patches/mesa-26.3
+                                  (see mesa27/README.md; the XeSS-only driver needs none of them)
+    fsr4/                         FSR4 on XMX: fs4shim source, fsr4-launch.sh, vkd3d-proton / dxil-spirv patches
+    tests/fsr4/                   synthetic driver tests for the parts above
+    docs/                         how it works, building, debugging, games; docs/fsr4.md: FSR4 on XMX
     .github/workflows/build.yml   CI: builds the shim, the ICD and both drivers, checks the scripts
 
 The release archive holds the binaries (`igdext64.dll`, the drivers in `lib/mesa-<version>/`, the ICD

@@ -1,0 +1,32 @@
+From 76738ab488f6865719759ab5e941dd0f0b16de1a Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 14:49:24 -0300
+Subject: [PATCH 01/10] anv: one shader-dump archive per device
+
+(cherry picked from commit 97abd96fd63c6017a3a7bf49845906b1ae642851)
+(cherry picked from commit 84c0fc875bc4959156225db258c717736d47d239)
+---
+ src/intel/vulkan/anv_shader.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/intel/vulkan/anv_shader.c b/src/intel/vulkan/anv_shader.c
+index d953915f46c..b969248d33b 100644
+--- a/src/intel/vulkan/anv_shader.c
++++ b/src/intel/vulkan/anv_shader.c
+@@ -21,8 +21,15 @@ anv_device_init_shader_dump(struct anv_device *device)
+ 
+    /* No filename -> stdout */
+    if (ANV_DEBUG(SHADER_DUMP)) {
++      /* One archive per device: several devices in one process would
++       * otherwise truncate each other's file.
++       */
++      static uint32_t device_count;
++      char name[64];
++      snprintf(name, sizeof(name), "anv-shaders-%d-%u", (int)getpid(),
++               p_atomic_inc_return(&device_count));
+       device->shader_dump.archive =
+-         debug_archiver_open(NULL, "anv-shaders", "");
++         debug_archiver_open(NULL, name, "");
+       if (device->shader_dump.archive == NULL)
+          return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }

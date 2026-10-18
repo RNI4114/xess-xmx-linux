@@ -1,0 +1,493 @@
+From 5b97f0e79162f752adf8393eef30c39665e68a92 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 08:25:58 -0300
+Subject: [PATCH 1/3] dlss-jay: coopmat 16x16x16 split, vector/block cmat
+ loads, Jay phi RA affinity, Large GRF for DPAS, ANV_CM_OFF
+
+Saved before removing dlss-xmx; base for fs4-xmx.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../brw/brw_nir_lower_cooperative_matrix.c    | 115 +++++++++++++++--
+ src/intel/compiler/jay/jay_from_nir.c         | 122 +++++++++++++++++-
+ src/intel/compiler/jay/jay_partition.c        |  13 ++
+ .../compiler/jay/jay_register_allocate.c      |  22 ++--
+ src/intel/vulkan/anv_physical_device.c        |  22 +++-
+ src/intel/vulkan/anv_private.h                |   1 +
+ src/intel/vulkan/anv_shader_compile.c         |   7 +
+ src/intel/vulkan/genX_cmd_compute.c           |   6 +-
+ 8 files changed, 270 insertions(+), 38 deletions(-)
+
+diff --git a/src/intel/compiler/brw/brw_nir_lower_cooperative_matrix.c b/src/intel/compiler/brw/brw_nir_lower_cooperative_matrix.c
+index 89bf306f43b..392dabceef9 100644
+--- a/src/intel/compiler/brw/brw_nir_lower_cooperative_matrix.c
++++ b/src/intel/compiler/brw/brw_nir_lower_cooperative_matrix.c
+@@ -317,9 +317,70 @@ lower_cmat_load_store(nir_builder *b, nir_intrinsic_instr *intrin,
+       const struct glsl_type *element_type =
+          glsl_scalar_type(glsl_get_base_type(slice->type));
+ 
+-      pointer = nir_build_deref_cast(b, &pointer->def, pointer->modes,
+-                                     element_type,
+-                                     glsl_get_bit_size(element_type) / 8);
++      /* Vulkan (VUID-RuntimeSpirv-OpCooperativeMatrixLoadKHR-08986): the
++       * Pointer and Stride must be aligned to at least the lesser of 16 bytes
++       * or the natural alignment of a row or column of the matrix. Every
++       * configuration we expose has rows/columns of at least 16 bytes, so each
++       * packed dword we access here is dword aligned. Without saying so, the
++       * cast inherits the alignment of e.g. a float16_t array and every dword
++       * access is split into two 16-bit messages plus a pack.
++       */
++      const unsigned elem_bytes =
++         glsl_base_type_get_bit_size(desc.element_type) / 8;
++      const unsigned line_elems =
++         nir_intrinsic_matrix_layout(intrin) == GLSL_MATRIX_LAYOUT_COLUMN_MAJOR ?
++         desc.rows : desc.cols;
++      const unsigned implicit_align = MIN2(16, line_elems * elem_bytes);
++      const unsigned dword_bytes = glsl_get_bit_size(element_type) / 8;
++
++      if (implicit_align >= dword_bytes) {
++         pointer = nir_build_deref_cast_with_alignment(b, &pointer->def,
++                                                       pointer->modes,
++                                                       element_type,
++                                                       dword_bytes,
++                                                       dword_bytes, 0);
++      } else {
++         pointer = nir_build_deref_cast(b, &pointer->def, pointer->modes,
++                                        element_type, dword_bytes);
++      }
++
++      /* A packed row-major tile (A or accumulator whose stride is exactly one
++       * row) is contiguous in memory in register order: lane l of component i
++       * reads dword i * subgroup_size + l. That is a subgroup block read (or
++       * write), one message per 64 dwords instead of one per component. The pointer
++       * and stride are subgroup uniform for cooperative matrix operations.
++       */
++      /* Opt-in for now (INTEL_CMAT_BLOCK=1): Jay miscompiles these block
++       * messages when the shader spills (seen with dlss-xmx layer8 BF_TILED,
++       * enc4: 85 spills, wrong output), and the UGPR staging they need adds
++       * register pressure that ate the gain.
++       */
++      static int block_enabled = -1;   /* 1: loads and stores, 2: loads, 3: stores */
++      if (block_enabled < 0)
++         block_enabled = debug_get_num_option("INTEL_CMAT_BLOCK", 0);
++      if ((block_enabled == 1 || block_enabled == (load ? 2 : 3)) && nir_src_is_const(intrin->src[2]) &&
++          nir_intrinsic_matrix_layout(intrin) == GLSL_MATRIX_LAYOUT_ROW_MAJOR &&
++          implicit_align >= dword_bytes && dword_bytes == 4 &&
++          (pointer->modes & ~(nir_var_mem_ssbo | nir_var_mem_shared |
++                              nir_var_mem_global)) == 0) {
++         const uint64_t stride_elems =
++            nir_src_as_uint(intrin->src[2]) * ptr_comp_width * ptr_num_comps /
++            glsl_base_type_get_bit_size(desc.element_type);
++
++         if (stride_elems == desc.cols &&
++             state->subgroup_size % cols == 0) {
++            if (load) {
++               nir_def *v = nir_load_deref_block_intel(b, num_components, 32,
++                                                       &pointer->def);
++               nir_store_deref(b, slice, v,
++                               nir_component_mask(num_components));
++            } else {
++               nir_store_deref_block_intel(b, &pointer->def,
++                                           nir_load_deref(b, slice));
++            }
++            return;
++         }
++      }
+ 
+       for (unsigned i = 0; i < num_components; i++) {
+          nir_def *offset = nir_imul_imm(b, i_step, i);
+@@ -868,17 +929,43 @@ lower_cmat_instr(nir_builder *b, nir_instr *instr, void *_state)
+          }
+       }
+ 
+-      nir_def *result =
+-         nir_dpas_intel(b,
+-                        dst_info->packing_factor * glsl_base_type_get_bit_size(dst_info->desc.element_type),
+-                        nir_load_deref(b, accum_slice),
+-                        nir_load_deref(b, B_slice),
+-                        nir_load_deref(b, A_slice),
+-                        .dest_base_type = dst_type,
+-                        .src_base_type = src_type,
+-                        .saturate = nir_intrinsic_saturate(intrin),
+-                        .systolic_depth = 8,
+-                        .repeat_count = 8);
++      const unsigned dst_bits =
++         dst_info->packing_factor * glsl_base_type_get_bit_size(dst_info->desc.element_type);
++      nir_def *accum = nir_load_deref(b, accum_slice);
++      nir_def *B = nir_load_deref(b, B_slice);
++      nir_def *A = nir_load_deref(b, A_slice);
++
++      /* One DPAS computes at most 8 rows (repeat count 8). A 16-row A and
++       * result are two 8-row matrices stacked: in both slices the first half
++       * of the components holds rows 0-7 and the second half rows 8-15, so
++       * the product is two DPAS on the halves with the same B.
++       */
++      const unsigned halves = src_info->desc.rows / 8;
++      assert(halves == 1 || halves == 2);
++      nir_def *parts[2] = { NULL, NULL };
++      for (unsigned i = 0; i < halves; i++) {
++         const unsigned nd = accum->num_components / halves;
++         const unsigned na = A->num_components / halves;
++         parts[i] =
++            nir_dpas_intel(b, dst_bits,
++                           halves == 1 ? accum : nir_channels(b, accum, BITFIELD_RANGE(i * nd, nd)),
++                           B,
++                           halves == 1 ? A : nir_channels(b, A, BITFIELD_RANGE(i * na, na)),
++                           .dest_base_type = dst_type,
++                           .src_base_type = src_type,
++                           .saturate = nir_intrinsic_saturate(intrin),
++                           .systolic_depth = 8,
++                           .repeat_count = 8);
++      }
++      nir_def *result = parts[0];
++      if (halves == 2) {
++         nir_scalar comps[NIR_MAX_VEC_COMPONENTS];
++         unsigned n = 0;
++         for (unsigned i = 0; i < 2; i++)
++            for (unsigned c = 0; c < parts[i]->num_components; c++)
++               comps[n++] = nir_get_scalar(parts[i], c);
++         result = nir_vec_scalars(b, comps, n);
++      }
+ 
+       nir_store_deref(b, dst_slice, result,
+                       nir_component_mask(num_components));
+diff --git a/src/intel/compiler/jay/jay_from_nir.c b/src/intel/compiler/jay/jay_from_nir.c
+index c49b468a27f..660fdeb287a 100644
+--- a/src/intel/compiler/jay/jay_from_nir.c
++++ b/src/intel/compiler/jay/jay_from_nir.c
+@@ -1449,11 +1449,37 @@ jay_emit_mem_access_lsc(struct nir_to_jay_state *nj, nir_intrinsic_instr *intr)
+       uniform &= !urb;
+    }
+ 
++   /* Subgroup block read (e.g. cooperative matrix loads of packed tiles): one
++    * address for the whole subgroup, and lane l of component c receives dword
++    * c * dispatch_width + l. A transposed message writes whole GRFs in exactly
++    * that order, so issue it as a uniform load into UGPRs and reinterpret each
++    * GRF worth of UGPRs as one GPR value afterwards.
++    */
++   bool block = intr->intrinsic == nir_intrinsic_load_global_block_intel ||
++                intr->intrinsic == nir_intrinsic_load_ssbo_block_intel ||
++                intr->intrinsic == nir_intrinsic_load_shared_block_intel ||
++                intr->intrinsic == nir_intrinsic_store_global_block_intel ||
++                intr->intrinsic == nir_intrinsic_store_ssbo_block_intel ||
++                intr->intrinsic == nir_intrinsic_store_shared_block_intel;
++   if (block) {
++      assert(ndata->bit_size == 32 && !cmask);
++      uniform = true;
++
++      if (offset.file == GPR) {
++         jay_def chans[2];
++         for (unsigned c = 0; c < jay_num_values(offset); ++c)
++            chans[c] = emit_uniformize(nj, jay_extract(offset, c));
++         offset = jay_num_values(offset) == 2 ?
++                  jay_collect_two(b, chans[0], chans[1]) : chans[0];
++      }
++   }
++
+    /* Per bspec 57330, 8-bit/16-bit/unaligned are not supported for transpose */
+-   bool transpose = (uniform && !cmask) &&
+-                    ndata->bit_size >= 32 &&
+-                    (!nir_intrinsic_has_align(intr) ||
+-                     nir_intrinsic_align(intr) >= ndata->bit_size / 8);
++   bool transpose = block ||
++                    ((uniform && !cmask) &&
++                     ndata->bit_size >= 32 &&
++                     (!nir_intrinsic_has_align(intr) ||
++                      nir_intrinsic_align(intr) >= ndata->bit_size / 8));
+ 
+    if (!uniform) {
+       offset = jay_as_gpr(b, offset);
+@@ -1541,11 +1567,91 @@ jay_emit_mem_access_lsc(struct nir_to_jay_state *nj, nir_intrinsic_instr *intr)
+ 
+    unsigned nr = ndata->num_components;
+ 
+-   if (transpose) {
++   if (block) {
++      nr *= b->shader->dispatch_width;
++   } else if (transpose) {
+       /* TODO: Overhaul the NIR passes so this isn't necessary */
+       nr = brw_uniform_block_size(devinfo, nr);
+    }
+ 
++   /* Transposed messages carry at most 64 elements, so split block reads */
++   const unsigned chunk = block ? MIN2(nr, 64) : nr;
++   assert(nr % chunk == 0);
++
++   if (block) {
++      jay_def tmp = jay_alloc_def(b, UGPR, nr);
++      const unsigned per_grf = jay_ugpr_per_grf(b->shader);
++      assert(jay_grf_per_gpr(b->shader) == 1 && per_grf == b->shader->dispatch_width);
++
++      /* Stores: lay each GPR value out as one GRF worth of UGPRs. This is a
++       * per-lane copy (not uniform) even though it writes UGPRs.
++       */
++      if (!has_dest) {
++         data = jay_as_gpr(b, data);
++         jay_foreach_comp(data, i) {
++            jay_MOV(b, jay_extract_range(tmp, i * per_grf, per_grf),
++                    jay_extract(data, i))->uniform = false;
++         }
++      }
++
++      for (unsigned k = 0; k < nr / chunk; ++k) {
++         const int32_t chunk_offset = base_offset + k * chunk * 4;
++         jay_def chunk_addr = offset;
++         uint64_t desc =
++            lsc_msg_desc(devinfo, op, surf_type, addr_size, LSC_DATA_SIZE_D32,
++                         chunk, true, cache);
++         jay_def ex_desc = jay_null();
++         uint32_t ex_desc_imm = 0;
++
++         if (surf_type == LSC_ADDR_SURFTYPE_FLAT ||
++             (surf_type == LSC_ADDR_SURFTYPE_BTI && jay_is_null(bti_indirect))) {
++            gen_lsc_ex_desc gen_ex_desc = { .addr_type = surf_type };
++            if (surf_type == LSC_ADDR_SURFTYPE_FLAT) {
++               gen_ex_desc.flat.base_offset = chunk_offset;
++            } else {
++               gen_ex_desc.bti.index = bti_const;
++               gen_ex_desc.bti.base_offset = chunk_offset;
++            }
++            desc |= ((uint64_t) gen_lsc_ex_desc_encode(devinfo, op,
++                                                      &gen_ex_desc, NULL)
++                     << 32);
++         } else if (surf_type == LSC_ADDR_SURFTYPE_SS ||
++                    surf_type == LSC_ADDR_SURFTYPE_BSS) {
++            ex_desc = emit_uniformize(nj, bti_indirect);
++            const gen_lsc_ex_desc gen_ex_desc = {
++               .addr_type = surf_type,
++               .surface_state = { .base_offset = chunk_offset },
++            };
++            gen_lsc_ex_desc_encode(devinfo, op, &gen_ex_desc, &ex_desc_imm);
++         } else {
++            /* Indirect BTI takes no immediate offset: step the address */
++            assert(surf_type == LSC_ADDR_SURFTYPE_BTI && base_offset == 0);
++            ex_desc = jay_SHL_u32(b, emit_uniformize(nj, bti_indirect), 24);
++            if (k > 0)
++               chunk_addr = jay_ADD_u32(b, offset, k * chunk * 4);
++         }
++
++         jay_def srcs[] = { chunk_addr, jay_extract_range(tmp, k * chunk, chunk) };
++         jay_SEND(b, .sfid = sfid, .msg_desc = desc, .srcs = srcs,
++                  .nr_srcs = has_dest ? 1 : 2,
++                  .dst = has_dest ? jay_extract_range(tmp, k * chunk, chunk) :
++                                    jay_null(),
++                  .type = JAY_TYPE_U32, .src_type = { offset_type, JAY_TYPE_U32 },
++                  .uniform = true, .pure = nir_intrinsic_can_reorder(intr),
++                  .bindless = surf_type == LSC_ADDR_SURFTYPE_BSS,
++                  .ex_desc = ex_desc, .ex_desc_imm = ex_desc_imm,
++                  .skip_helpers = skip_helpers,
++                  .use_raw_ex_desc = surf_type == LSC_ADDR_SURFTYPE_SS);
++      }
++
++      /* Each GRF worth of UGPRs is one 32-bit GPR value */
++      if (has_dest) jay_foreach_comp(dst, i) {
++         jay_MOV(b, jay_extract(dst, i),
++                 jay_extract_range(tmp, i * per_grf, per_grf));
++      }
++      return;
++   }
++
+    uint64_t desc =
+       lsc_msg_desc(devinfo, op, surf_type, addr_size,
+                    lsc_bits_to_data_size(ndata->bit_size),
+@@ -2392,6 +2498,9 @@ jay_emit_intrinsic(struct nir_to_jay_state *nj, nir_intrinsic_instr *intr)
+    case nir_intrinsic_load_scratch_intel:
+    case nir_intrinsic_load_shared:
+    case nir_intrinsic_load_shared_uniform_block_intel:
++   case nir_intrinsic_load_global_block_intel:
++   case nir_intrinsic_load_shared_block_intel:
++   case nir_intrinsic_load_ssbo_block_intel:
+    case nir_intrinsic_load_ssbo:
+    case nir_intrinsic_load_ssbo_intel:
+    case nir_intrinsic_load_ssbo_uniform_block_intel:
+@@ -2407,6 +2516,9 @@ jay_emit_intrinsic(struct nir_to_jay_state *nj, nir_intrinsic_instr *intr)
+    case nir_intrinsic_store_urb_lsc_intel:
+    case nir_intrinsic_store_scratch_intel:
+    case nir_intrinsic_store_shared:
++   case nir_intrinsic_store_global_block_intel:
++   case nir_intrinsic_store_shared_block_intel:
++   case nir_intrinsic_store_ssbo_block_intel:
+    case nir_intrinsic_store_ssbo:
+    case nir_intrinsic_store_ssbo_intel:
+    case nir_intrinsic_bindless_image_load:
+diff --git a/src/intel/compiler/jay/jay_partition.c b/src/intel/compiler/jay/jay_partition.c
+index 6e5ac688e1f..4041f009235 100644
+--- a/src/intel/compiler/jay/jay_partition.c
++++ b/src/intel/compiler/jay/jay_partition.c
+@@ -407,6 +407,19 @@ jay_partition_grf(jay_shader *shader)
+                                       shader->prog_data->base.source_hash,
+                                       uniform_grfs + estimate_nonunif_grf);
+ 
++      /* Xe2 has no per-shader register file size, only the engine-wide
++       * STATE_COMPUTE_MODE Large GRF Mode (256 GRFs, half the threads per EU),
++       * which ANV switches around the dispatches that need it. Use it for
++       * compute shaders doing DPAS (cooperative matrices) that would otherwise
++       * spill: their live matrix tiles are what the register file is for.
++       */
++      if (shader->devinfo->ver == 20 && hw_grfs == 128 &&
++          mesa_shader_stage_uses_workgroup(shader->stage) &&
++          shader->stage == MESA_SHADER_COMPUTE &&
++          shader->prog_data->cs.uses_systolic &&
++          uniform_grfs + estimate_nonunif_grf > 128)
++         hw_grfs = 256;
++
+       /* We want to determine a good GPR/UGPR split by the demand calculation.
+        * At minimum we need to not spill UGPRs, but if GPR pressure is low we
+        * want to take extra UGPRs to reduce shuffling.
+diff --git a/src/intel/compiler/jay/jay_register_allocate.c b/src/intel/compiler/jay/jay_register_allocate.c
+index 01aac22035f..a449ac393c2 100644
+--- a/src/intel/compiler/jay/jay_register_allocate.c
++++ b/src/intel/compiler/jay/jay_register_allocate.c
+@@ -1545,18 +1545,16 @@ jay_register_allocate_function(jay_function *f)
+             ra.affinities[index].align_offs = c;
+          }
+ 
+-         enum jay_stride old_stride = ra.affinities[index].stride;
+-         enum jay_stride new_stride = jay_src_stride_minmax(I, s, false);
+-         if (old_stride == JAY_NUM_STRIDES || old_stride == new_stride) {
+-            ra.affinities[index].stride = new_stride;
+-            ra.affinities[index].src_weight =
+-               MAX2(ra.affinities[index].src_weight, block->weight);
+-         } else {
+-            ra.affinities[index].mixed_stride = true;
+-         }
+-
+-         ra.phi_web[phi_web_find(ra.phi_web, index)].affinity =
+-            ra.affinities[index];
++         /* A later scalar use (e.g. the loop back-edge phi source of a DPAS
++          * accumulator) must not erase the vector affinity an earlier use
++          * gave the web, or the web loses its alignment and every iteration
++          * shuffles the whole vector into place and back.
++          */
++         struct affinity *web =
++            &ra.phi_web[phi_web_find(ra.phi_web, index)].affinity;
++         if ((ra.affinities[index].repr || !web->repr) &&
++             ra.affinities[index].align >= web->align)
++            *web = ra.affinities[index];
+       }
+    }
+ 
+diff --git a/src/intel/vulkan/anv_physical_device.c b/src/intel/vulkan/anv_physical_device.c
+index b9222882982..bc80c898fea 100644
+--- a/src/intel/vulkan/anv_physical_device.c
++++ b/src/intel/vulkan/anv_physical_device.c
+@@ -3723,7 +3723,7 @@ VkResult anv_GetPhysicalDeviceFragmentShadingRatesKHR(
+ 
+ static void
+ anv_fill_all_cooperative_matrix_props(const struct anv_physical_device *pdevice, struct __vk_outarray *base,
+-                                      void (*fill_cb)(struct __vk_outarray *base, unsigned exec_size,
++                                      void (*fill_cb)(struct __vk_outarray *base, unsigned m_size, unsigned exec_size,
+                                                       VkComponentTypeKHR a_type, VkComponentTypeKHR b_type,
+                                                       VkComponentTypeKHR c_type, VkComponentTypeKHR r_type,
+                                                       unsigned ops_per_chan, bool saturate))
+@@ -3735,13 +3735,15 @@ anv_fill_all_cooperative_matrix_props(const struct anv_physical_device *pdevice,
+    const bool emulated = debug_get_bool_option("INTEL_LOWER_DPAS", false);
+    const unsigned exec_size = devinfo->ver >= 20 ? 16 : 8;
+ 
+-#define FILL(a_type, b_type, c_type, r_type, ops_per_chan, sat) \
+-   fill_cb(base, exec_size,                                     \
++#define FILL_M(m, a_type, b_type, c_type, r_type, ops_per_chan, sat) \
++   fill_cb(base, m, exec_size,                                  \
+            VK_COMPONENT_TYPE_##a_type##_KHR,                    \
+            VK_COMPONENT_TYPE_##b_type##_KHR,                    \
+            VK_COMPONENT_TYPE_##c_type##_KHR,                    \
+            VK_COMPONENT_TYPE_##r_type##_KHR,                    \
+            ops_per_chan, sat)
++#define FILL(a_type, b_type, c_type, r_type, ops_per_chan, sat) \
++   FILL_M(8, a_type, b_type, c_type, r_type, ops_per_chan, sat)
+ 
+    /* Note: XeHP doesn't have this configuration. */
+    if (devinfo->ver >= 20 || emulated)
+@@ -3758,11 +3760,21 @@ anv_fill_all_cooperative_matrix_props(const struct anv_physical_device *pdevice,
+    FILL(SINT8, SINT8, SINT32, SINT32, 4, false);
+    FILL(UINT8, UINT8, UINT32, UINT32, 4, false);
+ 
++   /* 16-row A and result matrices on Xe2: two stacked 8-row DPAS sharing B
++    * (brw_nir_lower_cooperative_matrix.c), the 16x16x16 shape most portable
++    * cooperative-matrix code is written for.
++    */
++   if (devinfo->ver >= 20 && !emulated) {
++      FILL_M(16, FLOAT16, FLOAT16, FLOAT16, FLOAT16, 2, false);
++      FILL_M(16, FLOAT16, FLOAT16, FLOAT32, FLOAT32, 2, false);
++   }
++
+ #undef FILL
++#undef FILL_M
+ }
+ 
+ static void
+-anv_fill_cooperative_matrix_prop(struct __vk_outarray *base, unsigned exec_size,
++anv_fill_cooperative_matrix_prop(struct __vk_outarray *base, unsigned m_size, unsigned exec_size,
+                                  VkComponentTypeKHR a_type, VkComponentTypeKHR b_type,
+                                  VkComponentTypeKHR c_type, VkComponentTypeKHR r_type,
+                                  unsigned ops_per_chan, bool saturate)
+@@ -3772,7 +3784,7 @@ anv_fill_cooperative_matrix_prop(struct __vk_outarray *base, unsigned exec_size,
+    vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, out, p)
+    {
+       *p = (struct VkCooperativeMatrixPropertiesKHR){.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+-                                                     .MSize = 8,
++                                                     .MSize = m_size,
+                                                      .NSize = exec_size,
+                                                      .KSize = 8 * ops_per_chan,
+                                                      .AType = a_type,
+diff --git a/src/intel/vulkan/anv_private.h b/src/intel/vulkan/anv_private.h
+index cbe96a6f5d7..4bee4421e25 100644
+--- a/src/intel/vulkan/anv_private.h
++++ b/src/intel/vulkan/anv_private.h
+@@ -1278,6 +1278,7 @@ struct anv_cm_env {
+    bool debug;               /* ANV_CM_DEBUG */
+    int trace;                /* ANV_CM_TRACE=1|2 */
+    bool pc, sync;
++   bool off;                 /* ANV_CM_OFF: serve no C-for-Metal kernel (XeSS falls back to DP4a) */
+    const char *view, *gcap, *capture, *only, *skip, *cap_dir;
+    uint32_t maxgroups;
+    int preempt;
+diff --git a/src/intel/vulkan/anv_shader_compile.c b/src/intel/vulkan/anv_shader_compile.c
+index bd062640e60..e2eee8bebd9 100644
+--- a/src/intel/vulkan/anv_shader_compile.c
++++ b/src/intel/vulkan/anv_shader_compile.c
+@@ -1106,6 +1106,7 @@ anv_cm_env_init(void)
+    struct anv_cm_env *e = &anv_cm_env_data;
+    e->kernel_dir = getenv("ANV_CM_KERNEL_DIR");
+    e->debug = getenv("ANV_CM_DEBUG") != NULL;
++   e->off = getenv("ANV_CM_OFF") != NULL;
+    const char *t = getenv("ANV_CM_TRACE");
+    e->trace = t ? (t[0] == '2' ? 2 : 1) : 0;
+    e->pc = getenv("ANV_CM_PC") != NULL;
+@@ -1516,6 +1517,12 @@ anv_cm_kernel_replace(struct anv_device *device, void *mem_ctx,
+    const struct anv_cm_env *env = anv_cm_env();
+    const uint32_t wx = nir->info.workgroup_size[0], wy = nir->info.workgroup_size[1], wz = nir->info.workgroup_size[2];
+    char path[512] = "";
++   /* ANV_CM_OFF=1: the driver serves no C-for-Metal kernel at all, i.e. it behaves like an unpatched driver. The
++    * shim's self-test placeholder then never gets its anv_canary, so XeSS declines the Intel extension context and
++    * runs its DP4a path. That is the cross-check of IGDEXT_FORCE_FALLBACK without touching the prefix: same driver
++    * binary, same session-level setup, only this switch. */
++   if (env->off)
++      return ANV_CM_NOT_PLACEHOLDER;
+    /* developer route: a .cmk named after the SPIR-V's blake3 replaces any compute shader (own test kernels) */
+    if (env->kernel_dir) {
+       char hex[33];
+diff --git a/src/intel/vulkan/genX_cmd_compute.c b/src/intel/vulkan/genX_cmd_compute.c
+index bab21737360..83744754b24 100644
+--- a/src/intel/vulkan/genX_cmd_compute.c
++++ b/src/intel/vulkan/genX_cmd_compute.c
+@@ -610,7 +610,8 @@ emit_indirect_compute_walker(struct anv_cmd_buffer *cmd_buffer,
+    const struct intel_cs_dispatch_info dispatch =
+       brw_cs_get_dispatch_info(devinfo, prog_data, NULL);
+ 
+-   genX(cmd_buffer_set_cm_large_grf)(cmd_buffer, prog_data->uses_cm_kernel &&
++   genX(cmd_buffer_set_cm_large_grf)(cmd_buffer, (prog_data->uses_cm_kernel ||
++                                                  prog_data->uses_systolic) &&
+                                                  prog_data->base.grf_used > 128);
+ 
+    uint64_t indirect_addr64 = anv_address_physical(indirect_addr);
+@@ -743,7 +744,8 @@ emit_compute_walker(struct anv_cmd_buffer *cmd_buffer,
+ 
+    /* Large GRF Mode on for 256-GRF CM kernels, off again for everything else (see
+     * genX(cmd_buffer_set_cm_large_grf)); a no-op unless the mode actually changes. */
+-   genX(cmd_buffer_set_cm_large_grf)(cmd_buffer, prog_data->uses_cm_kernel &&
++   genX(cmd_buffer_set_cm_large_grf)(cmd_buffer, (prog_data->uses_cm_kernel ||
++                                                  prog_data->uses_systolic) &&
+                                                  prog_data->base.grf_used > 128);
+ 
+    uint64_t push_addr64 = anv_address_physical(

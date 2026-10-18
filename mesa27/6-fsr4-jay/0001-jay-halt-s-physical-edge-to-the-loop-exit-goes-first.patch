@@ -1,0 +1,44 @@
+From 6e0d685b634faf4f5eecdba10d7ea2dcc1cfc065 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 09:55:15 -0300
+Subject: [PATCH 1/9] jay: halt's physical edge to the loop exit goes first in
+ the successors
+
+The UGPR edge from a halt in a divergent loop body to the loop exit
+(7e4d3a8d90f) was appended after the edge to the exit block. When the loop
+exit is the next block that edge is the physical fall-through, and main's
+jay_validate now requires a fall-through edge to be the first successor:
+Cyberpunk 2077 aborted on 'succ != next_block || is_first_successor' with
+the asserting build.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/compiler/jay/jay_from_nir.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/intel/compiler/jay/jay_from_nir.c b/src/intel/compiler/jay/jay_from_nir.c
+index 660fdeb287a..15e4d93d739 100644
+--- a/src/intel/compiler/jay/jay_from_nir.c
++++ b/src/intel/compiler/jay/jay_from_nir.c
+@@ -3877,8 +3877,20 @@ jay_block_reconverge(struct nir_to_jay_state *nj,
+        * resume, so RA may clobber UGPRs that are still live there (the stack
+        * IDs of btd_retire, which then releases the wrong stacks).
+        */
+-      if (nj->converge_block)
++      if (nj->converge_block &&
++          !jay_cfg_has_edge(current_block, nj->converge_block, UGPR)) {
+          jay_block_add_successor(current_block, nj->converge_block, UGPR);
++
++         /* That edge is the physical fall-through when the loop exit is the
++          * next block (the halt is the last thing in the loop body), and a
++          * fall-through edge must be the first successor (jay_validate).
++          */
++         struct util_dynarray *succs = jay_successors(current_block, UGPR);
++         jay_block **list = succs->data;
++         unsigned n = util_dynarray_num_elements(succs, jay_block *);
++         memmove(&list[1], &list[0], (n - 1) * sizeof(list[0]));
++         list[0] = nj->converge_block;
++      }
+    } else {
+       assert(!jump);
+       jay_block_add_successor(current_block, after_block, GPR);

@@ -1,0 +1,56 @@
+From 65898b13cd6e1cea1ac0bebc7e98559f58fb9ae0 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 20:14:17 -0300
+Subject: [PATCH 09/10] jay: vectorize post-RA splats of the same immediate
+ into consecutive UGPRs
+
+Generated-by: LLM
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../compiler/jay/jay_opt_postra_vectorize.c      | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/intel/compiler/jay/jay_opt_postra_vectorize.c b/src/intel/compiler/jay/jay_opt_postra_vectorize.c
+index 32a4d55102a..16952400974 100644
+--- a/src/intel/compiler/jay/jay_opt_postra_vectorize.c
++++ b/src/intel/compiler/jay/jay_opt_postra_vectorize.c
+@@ -17,7 +17,8 @@ vectorize(jay_function *f, jay_inst **vec, unsigned n)
+          unsigned simd = 1 << util_logbase2(n - i);
+          jay_inst *clone = jay_clone_inst(&b, vec[0], vec[0]->num_srcs);
+          clone->dst = jay_bare_regs(UGPR, vec[0]->dst.reg + i, simd);
+-         clone->src[0] = jay_bare_regs(UGPR, vec[0]->src[0].reg + i, simd);
++         if (!jay_is_imm(vec[0]->src[0]))
++            clone->src[0] = jay_bare_regs(UGPR, vec[0]->src[0].reg + i, simd);
+          jay_builder_insert(&b, clone);
+          i += simd;
+       }
+@@ -46,7 +47,8 @@ is_compatible(jay_shader *s, jay_inst **vec, unsigned n, const jay_inst *I)
+ {
+    /* If we're not vectorizable, don't vectorize with anything */
+    if (!((I->op == JAY_OPCODE_MOV && I->type == JAY_TYPE_U32) &&
+-         (I->dst.file == UGPR && I->src[0].file == UGPR))) {
++         (I->dst.file == UGPR &&
++          (I->src[0].file == UGPR || jay_is_imm(I->src[0]))))) {
+       return false;
+    }
+ 
+@@ -60,10 +62,18 @@ is_compatible(jay_shader *s, jay_inst **vec, unsigned n, const jay_inst *I)
+       return false;
+    }
+ 
++   unsigned ugpr_per_grf_log2 = util_logbase2(jay_ugpr_per_grf(s));
++
++   /* Splat the same immediate into consecutive channels of a GRF */
++   if (jay_is_imm(I->src[0]) || jay_is_imm(vec[0]->src[0])) {
++      return jay_is_imm(I->src[0]) && jay_is_imm(vec[0]->src[0]) &&
++             jay_as_uint(I->src[0]) == jay_as_uint(vec[0]->src[0]) &&
++             compatible_regs(I->dst, vec[0]->dst, n, ugpr_per_grf_log2);
++   }
++
+    /* We must access consecutive channels from the same GRF without overlap on
+     * the source/destination regions.
+     */
+-   unsigned ugpr_per_grf_log2 = util_logbase2(jay_ugpr_per_grf(s));
+    return compatible_regs(I->dst, vec[0]->dst, n, ugpr_per_grf_log2) &&
+           compatible_regs(I->src[0], vec[0]->src[0], n, ugpr_per_grf_log2) &&
+           !reg_in_range(I->dst, vec[0]->dst, n) &&

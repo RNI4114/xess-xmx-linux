@@ -1,0 +1,455 @@
+From c826990e83260434315df8a234eda3dc3a1c86d0 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 09:09:11 -0300
+Subject: [PATCH 2/3] intel: 16x16 cooperative matrices for D3D12 WMMA (FSR4)
+ in wave32
+
+D3D12 WMMA, as vkd3d-proton translates it, runs 16x16 matrices on one
+32-wide subgroup and converts between u8 storage and f16/f32 math with
+loops over the element index, expecting element i of a u8 matrix to be
+element i of the f16/f32 matrix of the same use.
+
+- 16x16 matrices narrower than the DPAS type of their use (8-bit A/B,
+  8/16-bit accumulators) use that type's field width, so each invocation
+  holds the same rows and columns whatever the element size; their loads
+  and stores go element by element and same-use conversions are element
+  wise.
+- Stop advertising 16x16x16 with an f16 accumulator (that accumulator is
+  widened and cannot feed DPAS).
+
+The stacked two-DPAS muladd already works at SIMD32 on Jay. Verified with
+fs4-xmx/tests/wmma32 (bit exact at subgroup 16 and 32).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../brw/brw_nir_lower_cooperative_matrix.c    | 236 +++++++++++++-----
+ src/intel/vulkan/anv_physical_device.c        |   8 +-
+ 2 files changed, 180 insertions(+), 64 deletions(-)
+
+diff --git a/src/intel/compiler/brw/brw_nir_lower_cooperative_matrix.c b/src/intel/compiler/brw/brw_nir_lower_cooperative_matrix.c
+index 392dabceef9..7527356f8e9 100644
+--- a/src/intel/compiler/brw/brw_nir_lower_cooperative_matrix.c
++++ b/src/intel/compiler/brw/brw_nir_lower_cooperative_matrix.c
+@@ -57,6 +57,12 @@ typedef struct {
+    /* How many cmat elements per slice element. */
+    unsigned packing_factor;
+ 
++   /* Bits each element occupies in the slice: the element size, or wider for
++    * a 16x16 matrix whose elements are narrower than the type of its use that
++    * feeds DPAS (see cmat_field_bits).
++    */
++   unsigned field_bits;
++
+    struct glsl_cmat_description desc;
+ 
+    /* Used by the tables.  Variable holding a slice or
+@@ -157,6 +163,54 @@ lower_cmat_filter(const nir_instr *instr, const void *_state)
+    }
+ }
+ 
++/* 16x16 matrices narrower than the DPAS type of their use (8-bit A/B, or
++ * 8/16-bit accumulators) only ever go to and from memory or get converted to
++ * the DPAS type element by element. D3D12 WMMA (FSR4 through vkd3d-proton)
++ * converts with loops over the element index and expects element i of a
++ * u8 matrix to be element i of the f16/f32 matrix of the same use. Give these
++ * types the field width of the DPAS type (16 bits for A/B, 32 for the
++ * accumulator), so that each invocation holds the same rows and columns, in
++ * the same order, whatever the element size.
++ */
++static unsigned
++cmat_field_bits(struct glsl_cmat_description desc)
++{
++   const unsigned bits = glsl_base_type_get_bit_size(desc.element_type);
++
++   if (desc.rows != 16 || desc.cols != 16)
++      return bits;
++
++   const unsigned dpas_bits = desc.use == GLSL_CMAT_USE_ACCUMULATOR ? 32 : 16;
++   return MAX2(bits, dpas_bits);
++}
++
++static bool
++slice_is_widened(const slice_info *info)
++{
++   return info->field_bits != glsl_base_type_get_bit_size(info->desc.element_type);
++}
++
++/* Split a slice component into its packing_factor elements, at element bit size. */
++static nir_def *
++unpack_fields(nir_builder *b, const slice_info *info, nir_def *packed)
++{
++   const unsigned bits = glsl_base_type_get_bit_size(info->desc.element_type);
++   nir_def *v = info->packing_factor > 1 ?
++      nir_unpack_bits(b, packed, info->field_bits) : packed;
++
++   return info->field_bits != bits ? nir_u2uN(b, v, bits) : v;
++}
++
++/* Inverse of unpack_fields: packing_factor elements into a slice component. */
++static nir_def *
++pack_fields(nir_builder *b, const slice_info *info, nir_def *elems)
++{
++   if (info->field_bits != elems->bit_size)
++      elems = nir_u2uN(b, elems, info->field_bits);
++
++   return info->packing_factor > 1 ? nir_pack_bits(b, elems, 32) : elems;
++}
++
+ static void
+ init_slice_info(struct lower_cmat_state *state,
+                 struct glsl_cmat_description desc,
+@@ -173,11 +227,12 @@ init_slice_info(struct lower_cmat_state *state,
+    assert(elements_per_invocation > 0);
+ 
+    const unsigned element_bits = 32;
+-   const unsigned bits = glsl_base_type_get_bit_size(desc.element_type);
++   const unsigned bits = cmat_field_bits(desc);
+ 
+    /* Each invocation must have at least one dword of data, and that dword
+     * must be tightly packed with values. No matter the matrix dimensions, a
+-    * matrix of uint8_t data must pack 4 values in each entry.
++    * matrix of uint8_t data must pack 4 values in each entry (16x16 matrices
++    * excepted, see cmat_field_bits).
+     */
+    const unsigned packing_factor = element_bits / bits;
+    assert(packing_factor <= BRW_MAX_PACKING_FACTOR);
+@@ -225,6 +280,73 @@ init_slice_info(struct lower_cmat_state *state,
+    info->type = slice_type;
+    info->desc = desc;
+    info->packing_factor = packing_factor;
++   info->field_bits = bits;
++}
++
++/* Load or store of a widened slice (cmat_field_bits): one element at a time,
++ * at the row and column lower_cmat_per_element_op assigns to it.
++ */
++static void
++lower_cmat_load_store_widened(nir_builder *b, nir_intrinsic_instr *intrin,
++                              struct lower_cmat_state *state,
++                              const slice_info *info, nir_deref_instr *slice,
++                              nir_deref_instr *pointer, nir_def *stride)
++{
++   const bool load = intrin->intrinsic == nir_intrinsic_cmat_load;
++   const struct glsl_cmat_description desc = info->desc;
++   const unsigned packing_factor = info->packing_factor;
++   const unsigned elem_bits = glsl_base_type_get_bit_size(desc.element_type);
++   const unsigned num_components = glsl_get_vector_elements(slice->type);
++   const bool row_major =
++      nir_intrinsic_matrix_layout(intrin) == GLSL_MATRIX_LAYOUT_ROW_MAJOR;
++
++   pointer = nir_build_deref_cast(b, &pointer->def, pointer->modes,
++                                  glsl_scalar_type(desc.element_type),
++                                  elem_bits / 8);
++
++   const unsigned cols = desc.use != GLSL_CMAT_USE_B ? desc.cols / packing_factor : desc.cols;
++   const unsigned row_step = state->subgroup_size / cols;
++   nir_def *invocation = nir_load_subgroup_invocation(b);
++   nir_def *invocation_div_cols = nir_udiv_imm(b, invocation, cols);
++   nir_def *invocation_mod_cols = nir_umod_imm(b, invocation, cols);
++
++   nir_def *src = load ? NULL : nir_load_deref(b, slice);
++   nir_def *results[NIR_MAX_VEC_COMPONENTS];
++
++   for (unsigned i = 0; i < num_components; i++) {
++      nir_def *row_group = nir_iadd_imm(b, invocation_div_cols, i * row_step);
++      nir_def *elems = load ? NULL : unpack_fields(b, info, nir_channel(b, src, i));
++      nir_def *v[BRW_MAX_PACKING_FACTOR];
++
++      for (unsigned j = 0; j < packing_factor; j++) {
++         nir_def *row, *col;
++         if (desc.use == GLSL_CMAT_USE_B) {
++            row = nir_iadd_imm(b, nir_imul_imm(b, row_group, packing_factor), j);
++            col = invocation_mod_cols;
++         } else {
++            row = row_group;
++            col = nir_iadd_imm(b, nir_imul_imm(b, invocation_mod_cols, packing_factor), j);
++         }
++
++         nir_def *offset = row_major ? nir_iadd(b, nir_imul(b, row, stride), col)
++                                     : nir_iadd(b, nir_imul(b, col, stride), row);
++         nir_deref_instr *memory_deref =
++            nir_build_deref_ptr_as_array(b, pointer,
++                                         nir_i2iN(b, offset, pointer->def.bit_size));
++
++         if (load)
++            v[j] = nir_load_deref(b, memory_deref);
++         else
++            nir_store_deref(b, memory_deref, nir_channel(b, elems, j), 0x1);
++      }
++
++      if (load)
++         results[i] = pack_fields(b, info, nir_vec(b, v, packing_factor));
++   }
++
++   if (load)
++      nir_store_deref(b, slice, nir_vec(b, results, num_components),
++                      nir_component_mask(num_components));
+ }
+ 
+ static void
+@@ -256,6 +378,11 @@ lower_cmat_load_store(nir_builder *b, nir_intrinsic_instr *intrin,
+                                                ptr_comp_width * ptr_num_comps),
+                                   glsl_base_type_get_bit_size(desc.element_type));
+ 
++   if (slice_is_widened(info)) {
++      lower_cmat_load_store_widened(b, intrin, state, info, slice, pointer, stride);
++      return;
++   }
++
+    /* The data that will be packed is in successive columns for A and
+     * accumulator matrices. The data that will be packed for B matrices is in
+     * successive rows.
+@@ -456,9 +583,6 @@ emit_packed_alu1(nir_builder *b,
+                  nir_op op,
+                  nir_def *src)
+ {
+-   const unsigned dst_bits = glsl_base_type_bit_size(dst_info->desc.element_type);
+-   const unsigned src_bits = glsl_base_type_bit_size(src_info->desc.element_type);
+-
+    const unsigned src_components = glsl_get_vector_elements(src_info->type);
+    const unsigned dst_components = glsl_get_vector_elements(dst_info->type);
+    assert(src_components * src_info->packing_factor ==
+@@ -469,12 +593,11 @@ emit_packed_alu1(nir_builder *b,
+    nir_def **tmp = state->scratch.tmp;
+ 
+    for (unsigned i = 0; i < src_components; i++) {
+-      nir_def *chan = nir_channel(b, src, i);
++      nir_def *elems = unpack_fields(b, src_info, nir_channel(b, src, i));
+ 
+       for (unsigned j = 0; j < src_info->packing_factor; j++) {
+          const unsigned pos = (i * src_info->packing_factor) + j;
+-         nir_def *val = nir_channel(b, nir_unpack_bits(b, chan, src_bits), j);
+-         tmp[pos] = nir_build_alu1(b, op, val);
++         tmp[pos] = nir_build_alu1(b, op, nir_channel(b, elems, j));
+       }
+    }
+ 
+@@ -494,8 +617,7 @@ emit_packed_alu1(nir_builder *b,
+       }
+ 
+       results[i] =
+-         nir_pack_bits(b, nir_vec(b, partial, dst_info->packing_factor),
+-                       dst_info->packing_factor * dst_bits);
++         pack_fields(b, dst_info, nir_vec(b, partial, dst_info->packing_factor));
+    }
+ 
+    return nir_vec(b, results, dst_components);
+@@ -542,16 +664,25 @@ lower_cmat_convert(nir_builder *b, nir_intrinsic_instr *intrin,
+    const unsigned dst_components = glsl_get_vector_elements(dst_info->type);
+    const unsigned dst_bits = glsl_base_type_bit_size(dst_info->desc.element_type);
+ 
+-   /* Apply signedness information from convert operation. */
+-   const nir_cmat_signed signed_mask = nir_intrinsic_cmat_signed_mask(intrin);
+-   struct glsl_cmat_description dst_desc = dst_info->desc;
+-   struct glsl_cmat_description src_desc = src_info->desc;
+-   dst_desc.element_type =
+-      glsl_apply_signedness_to_base_type(
+-         (enum glsl_base_type)dst_desc.element_type, signed_mask & NIR_CMAT_RESULT_SIGNED);
+-   src_desc.element_type =
+-      glsl_apply_signedness_to_base_type(
+-         (enum glsl_base_type)src_desc.element_type, signed_mask & NIR_CMAT_A_SIGNED);
++   /* Widened slices hold their elements where the DPAS type of the same use
++    * does, so the conversion is element by element.
++    */
++   if (slice_is_widened(src_info) || slice_is_widened(dst_info)) {
++      assert(src_info->packing_factor == dst_info->packing_factor);
++      const nir_op op = get_cmat_conversion_op(src_info->desc.element_type,
++                                               dst_info->desc.element_type);
++      nir_def *results[NIR_MAX_VEC_COMPONENTS];
++
++      for (unsigned i = 0; i < dst_components; i++) {
++         nir_def *elems = unpack_fields(b, src_info, nir_channel(b, src, i));
++         results[i] = pack_fields(b, dst_info, nir_build_alu1(b, op, elems));
++      }
++
++      nir_store_deref(b, dst_slice, nir_vec(b, results, dst_components),
++                      nir_component_mask(dst_components));
++      b->fp_math_ctrl = nir_fp_fast_math;
++      return;
++   }
+ 
+    nir_def *result = nir_convert_cmat_intel(b,
+                                             dst_components,
+@@ -599,23 +730,19 @@ lower_cmat_binary_op(nir_builder *b, nir_intrinsic_instr *intrin,
+    const unsigned num_components = glsl_get_vector_elements(dst_slice->type);
+ 
+    const slice_info *info = get_slice_info(state, dst_slice);
+-   ASSERTED const slice_info *src_a_info = get_slice_info(state, src_a_slice);
+-   ASSERTED const slice_info *src_b_info = get_slice_info(state, src_b_slice);
++   const slice_info *src_a_info = get_slice_info(state, src_a_slice);
++   const slice_info *src_b_info = get_slice_info(state, src_b_slice);
+ 
+    assert(cmat_descriptions_are_equal(info->desc, src_a_info->desc));
+    assert(cmat_descriptions_are_equal(info->desc, src_b_info->desc));
+ 
+-   const unsigned bits = glsl_base_type_bit_size(info->desc.element_type);
+-
+    for (unsigned i = 0; i < num_components; i++) {
+-      nir_def *val_a = nir_channel(b, src_a, i);
+-      nir_def *val_b = nir_channel(b, src_b, i);
++      nir_def *val_a = unpack_fields(b, src_a_info, nir_channel(b, src_a, i));
++      nir_def *val_b = unpack_fields(b, src_b_info, nir_channel(b, src_b, i));
+ 
+       results[i] =
+-         nir_pack_bits(b, nir_build_alu2(b, nir_intrinsic_alu_op(intrin),
+-                                         nir_unpack_bits(b, val_a, bits),
+-                                         nir_unpack_bits(b, val_b, bits)),
+-                       info->packing_factor * bits);
++         pack_fields(b, info, nir_build_alu2(b, nir_intrinsic_alu_op(intrin),
++                                             val_a, val_b));
+    }
+ 
+    nir_store_deref(b, dst_slice, nir_vec(b, results, num_components),
+@@ -640,16 +767,12 @@ lower_cmat_scalar_op(nir_builder *b, nir_intrinsic_instr *intrin,
+    ASSERTED const slice_info *src_info = get_slice_info(state, src_slice);
+    assert(cmat_descriptions_are_equal(info->desc, src_info->desc));
+ 
+-   const unsigned bits = glsl_base_type_bit_size(info->desc.element_type);
+-
+    for (unsigned i = 0; i < num_components; i++) {
+-      nir_def *val = nir_channel(b, src, i);
++      nir_def *val = unpack_fields(b, info, nir_channel(b, src, i));
+ 
+       results[i] =
+-         nir_pack_bits(b, nir_build_alu2(b, nir_intrinsic_alu_op(intrin),
+-                                         nir_unpack_bits(b, val, bits),
+-                                         scalar),
+-                       info->packing_factor * bits);
++         pack_fields(b, info, nir_build_alu2(b, nir_intrinsic_alu_op(intrin),
++                                             val, scalar));
+    }
+ 
+    nir_store_deref(b, dst_slice, nir_vec(b, results, num_components),
+@@ -698,7 +821,6 @@ lower_cmat_per_element_op(nir_builder *b, nir_cmat_call_instr *call,
+    }
+ 
+    const struct glsl_cmat_description desc = dst_info->desc;
+-   const unsigned bits = glsl_base_type_bit_size(desc.element_type);
+    const unsigned num_components = glsl_get_vector_elements(dst_slice->type);
+    const unsigned packing_factor = dst_info->packing_factor;
+    nir_def *src = nir_load_deref(b, src_slice);
+@@ -742,7 +864,7 @@ lower_cmat_per_element_op(nir_builder *b, nir_cmat_call_instr *call,
+          col_base = nir_imul_imm(b, col_base, packing_factor);
+ 
+       nir_def *packed = nir_vector_extract(b, src, iter);
+-      nir_def *unpacked = packing_factor > 1 ? nir_unpack_bits(b, packed, bits) : packed;
++      nir_def *unpacked = unpack_fields(b, src_info, packed);
+       nir_def *vals[BRW_MAX_PACKING_FACTOR] = {0};
+ 
+       for (unsigned j = 0; j < packing_factor; j++) {
+@@ -771,11 +893,8 @@ lower_cmat_per_element_op(nir_builder *b, nir_cmat_call_instr *call,
+             const slice_info *info = extra_params[p].slice_info;
+             if (info) {
+                def = nir_vector_extract(b, def, iter);
+-               if (info->packing_factor > 1) {
+-                  const unsigned param_bit_size =
+-                     glsl_base_type_bit_size(info->desc.element_type);
+-                  def = nir_channel(b, nir_unpack_bits(b, def, param_bit_size), j);
+-               }
++               if (info->packing_factor > 1 || slice_is_widened(info))
++                  def = nir_channel(b, unpack_fields(b, info, def), j);
+             }
+ 
+             new_call->params[4 + p] = nir_src_for_ssa(def);
+@@ -785,10 +904,7 @@ lower_cmat_per_element_op(nir_builder *b, nir_cmat_call_instr *call,
+          vals[j] = nir_load_deref(b, elem_deref);
+       }
+ 
+-      packed =
+-         packing_factor > 1 ? nir_pack_bits(b, nir_vec(b, vals, packing_factor),
+-                                            packing_factor * bits)
+-                            : vals[0];
++      packed = pack_fields(b, dst_info, nir_vec(b, vals, packing_factor));
+       nir_def *new_vec = nir_vector_insert(b, nir_load_deref(b, result_deref),
+                                            packed, iter);
+       nir_store_deref(b, result_deref, new_vec, nir_component_mask(num_components));
+@@ -856,10 +972,8 @@ lower_cmat_instr(nir_builder *b, nir_instr *instr, void *_state)
+ 
+       const slice_info *info = get_slice_info(state, slice);
+ 
+-      if (info->packing_factor > 1) {
+-         src = nir_pack_bits(b, nir_replicate(b, src, info->packing_factor),
+-                             info->packing_factor * glsl_base_type_get_bit_size(info->desc.element_type));
+-      }
++      if (info->packing_factor > 1 || slice_is_widened(info))
++         src = pack_fields(b, info, nir_replicate(b, src, info->packing_factor));
+ 
+       const unsigned num_components = glsl_get_vector_elements(slice->type);
+ 
+@@ -900,6 +1014,11 @@ lower_cmat_instr(nir_builder *b, nir_instr *instr, void *_state)
+       const slice_info *dst_info = get_slice_info(state, dst_slice);
+       const slice_info *src_info = get_slice_info(state, A_slice);
+ 
++      /* No advertised configuration has a widened operand (cmat_field_bits). */
++      assert(!slice_is_widened(dst_info) && !slice_is_widened(src_info) &&
++             !slice_is_widened(get_slice_info(state, B_slice)) &&
++             !slice_is_widened(get_slice_info(state, accum_slice)));
++
+       const unsigned num_components = glsl_get_vector_elements(dst_slice->type);
+ 
+       const nir_cmat_signed cmat_signed_mask =
+@@ -1002,7 +1121,6 @@ lower_cmat_instr(nir_builder *b, nir_instr *instr, void *_state)
+       ASSERTED const slice_info *src_info = get_slice_info(state, src_slice);
+       assert(cmat_descriptions_are_equal(info->desc, src_info->desc));
+ 
+-      const unsigned bits = glsl_base_type_bit_size(info->desc.element_type);
+       const unsigned num_components = glsl_get_vector_elements(dst_slice->type);
+ 
+       nir_def *slice_index = nir_udiv_imm(b, dst_index.ssa, info->packing_factor);
+@@ -1019,12 +1137,12 @@ lower_cmat_instr(nir_builder *b, nir_instr *instr, void *_state)
+ 
+          if (slice_constant_index < 0 || slice_constant_index == i) {
+             if (info->packing_factor == 1) {
+-               insert = scalar;
++               insert = pack_fields(b, info, scalar);
+             } else {
+-               nir_def *unpacked = nir_unpack_bits(b, val, bits);
++               nir_def *unpacked = unpack_fields(b, info, val);
+                nir_def *v = nir_vector_insert(b, unpacked, scalar, vector_index);
+ 
+-               insert = nir_pack_bits(b, v, bits * info->packing_factor);
++               insert = pack_fields(b, info, v);
+             }
+          } else {
+             insert = val;
+@@ -1046,17 +1164,15 @@ lower_cmat_instr(nir_builder *b, nir_instr *instr, void *_state)
+       const slice_info *info = get_slice_info(state, slice);
+       nir_def *index = intrin->src[1].ssa;
+ 
+-      const unsigned bits = glsl_base_type_bit_size(info->desc.element_type);
+-
+       nir_def *src =
+          nir_vector_extract(b, nir_load_deref(b, slice),
+                             nir_udiv_imm(b, index, info->packing_factor));
+ 
+       if (info->packing_factor == 1) {
+-         return src;
++         return unpack_fields(b, info, src);
+       } else {
+          return nir_vector_extract(b,
+-                                   nir_unpack_bits(b, src, bits),
++                                   unpack_fields(b, info, src),
+                                    nir_umod_imm(b, index, info->packing_factor));
+       }
+ 
+diff --git a/src/intel/vulkan/anv_physical_device.c b/src/intel/vulkan/anv_physical_device.c
+index bc80c898fea..793065058bf 100644
+--- a/src/intel/vulkan/anv_physical_device.c
++++ b/src/intel/vulkan/anv_physical_device.c
+@@ -3762,12 +3762,12 @@ anv_fill_all_cooperative_matrix_props(const struct anv_physical_device *pdevice,
+ 
+    /* 16-row A and result matrices on Xe2: two stacked 8-row DPAS sharing B
+     * (brw_nir_lower_cooperative_matrix.c), the 16x16x16 shape most portable
+-    * cooperative-matrix code is written for.
++    * cooperative-matrix code is written for (D3D12 WMMA among them, in wave32).
++    * Only with a 32-bit accumulator: 16x16 accumulators narrower than that
++    * use 32-bit fields (cmat_field_bits) and cannot feed DPAS directly.
+     */
+-   if (devinfo->ver >= 20 && !emulated) {
+-      FILL_M(16, FLOAT16, FLOAT16, FLOAT16, FLOAT16, 2, false);
++   if (devinfo->ver >= 20 && !emulated)
+       FILL_M(16, FLOAT16, FLOAT16, FLOAT32, FLOAT32, 2, false);
+-   }
+ 
+ #undef FILL
+ #undef FILL_M

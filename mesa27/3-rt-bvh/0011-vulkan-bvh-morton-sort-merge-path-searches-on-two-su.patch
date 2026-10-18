@@ -1,0 +1,113 @@
+From 9dd58e8b268098a3c1093fc4436b47d957d13cf6 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 21:15:19 -0300
+Subject: [PATCH 11/21] vulkan/bvh: morton sort: merge-path searches on two
+ subgroups in parallel
+
+Each global merge pass started with invocation 0 doing two binary searches
+over global memory (a chain of dependent loads) while the rest of the
+workgroup waited at a barrier. Do them on the first two subgroups in
+parallel, each testing a candidate per invocation per round.
+
+TLAS of 43.4k instances on a B580 (tlascheck): sort 169 -> 149 us.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 4b4ef3ca3508ece2dc5855810958c457e58c1882)
+(cherry picked from commit 54dfbd758b63c806f29b396c55191d054ec61013)
+---
+ src/vulkan/runtime/bvh/morton_sort.comp | 75 ++++++++++++++++++++-----
+ 1 file changed, 60 insertions(+), 15 deletions(-)
+
+diff --git a/src/vulkan/runtime/bvh/morton_sort.comp b/src/vulkan/runtime/bvh/morton_sort.comp
+index 2ea094c4f94..e7017f90b57 100644
+--- a/src/vulkan/runtime/bvh/morton_sort.comp
++++ b/src/vulkan/runtime/bvh/morton_sort.comp
+@@ -442,6 +442,42 @@ intra_wg_merge(inout KEY_T local_kvs[MORTON_SORT_KVS_PER_THREAD], uint32_t dst_t
+    merge_shared_kv_list(local_kvs, dst_threads_per_list, src_a_start, src_list_len, src_b_start, src_list_len);
+ }
+ 
++/* find_first_src_elem() over global memory, done by a whole subgroup: each round, every invocation
++ * tests one candidate spread evenly over the remaining range, and the range shrinks to the gap between
++ * the last candidate where A sorts first and the first one where it doesn't (those form a suffix, so it
++ * is the lowest bit of the ballot). Must be called with the whole subgroup active.
++ */
++uint32_t
++subgroup_find_first_src_elem(uint32_t src_a_start, uint32_t src_a_len, uint32_t src_b_start, uint32_t src_b_len,
++                             uint32_t first_dst_elem, KEY_REF src)
++{
++   /* Same bounds as find_first_src_elem(). */
++   uint32_t lo = first_dst_elem > src_b_len ? first_dst_elem - src_b_len : 0;
++   uint32_t hi = min(src_a_len, first_dst_elem);
++
++   while (lo < hi) {
++      /* Candidates lo + floor(n * i / lanes) are increasing, all in [lo, hi), and cover every index
++       * once n <= lanes, so the loop ends.
++       */
++      uint32_t n = hi - lo;
++      uint32_t lanes = gl_SubgroupSize;
++      uint32_t candidate = lo + uint32_t((uint64_t(n) * gl_SubgroupInvocationID) / lanes);
++      KEY_T a_key = DEREF(INDEX(KEY_T, src, src_a_start + candidate));
++      KEY_T b_key = DEREF(INDEX(KEY_T, src, src_b_start + first_dst_elem - 1 - candidate));
++      uvec4 not_first = subgroupBallot(!KEY_COMPARE(a_key, b_key));
++
++      /* The answer is in (candidate[j - 1], candidate[j]], with candidate[-1] = lo - 1 and
++       * candidate[lanes] = hi.
++       */
++      uint32_t j = subgroupBallotBitCount(not_first) == 0 ? lanes : subgroupBallotFindLSB(not_first);
++      uint32_t new_lo = j == 0 ? lo : lo + uint32_t((uint64_t(n) * (j - 1)) / lanes) + 1;
++      uint32_t new_hi = j == lanes ? hi : lo + uint32_t((uint64_t(n) * j) / lanes);
++      lo = new_lo;
++      hi = new_hi;
++   }
++   return lo;
++}
++
+ void
+ per_wg_merge(uint32_t kv_count, uint32_t wg_id, uint32_t dst_wgs_per_list, KEY_REF src, KEY_REF dst)
+ {
+@@ -466,21 +502,30 @@ per_wg_merge(uint32_t kv_count, uint32_t wg_id, uint32_t dst_wgs_per_list, KEY_R
+    uint32_t src_b_start = src_a_start + src_a_len;
+    uint32_t src_b_len = min(src_list_len, kv_count - src_b_start);
+ 
+-   if (gl_LocalInvocationID.x == 0) {
+-      shared_first_a_index =
+-         find_first_src_elem(src_a_start, src_a_len, src_b_start, src_b_len, first_dst_elem, true, src);
+-      shared_first_b_index = first_dst_elem - shared_first_a_index;
+-
+-      /* We know we're going to merge KEYVALS_PER_WG items, but we don't yet know which list we're going
+-       * to take them from. We may take all KEYVALS_PER_WG items from either list A or B, but we only have
+-       * space for KEYVALS_PER_WG items in total. Instead of allocating for the worst case, do another binary
+-       * search for the items belonging to the workgroup after us. The range from
+-       * "first element belonging to this workgroup" to "first element belonging to next workgroup" is precisely
+-       * the range containing elements we will merge.
+-       */
+-      shared_next_a_index =
+-         find_first_src_elem(src_a_start, src_a_len, src_b_start, src_b_len, first_dst_elem + items_to_write, true, src);
+-      shared_next_b_index = (first_dst_elem + items_to_write) - shared_next_a_index;
++   /* We know we're going to merge KEYVALS_PER_WG items, but we don't yet know which list we're going
++    * to take them from. We may take all KEYVALS_PER_WG items from either list A or B, but we only have
++    * space for KEYVALS_PER_WG items in total. Instead of allocating for the worst case, do another
++    * search for the items belonging to the workgroup after us. The range from
++    * "first element belonging to this workgroup" to "first element belonging to next workgroup" is precisely
++    * the range containing elements we will merge.
++    *
++    * The two searches run in parallel on the first two subgroups, each one testing a candidate per
++    * invocation every round. A single-invocation binary search over global memory is a chain of
++    * dependent loads that the whole workgroup waits for in every merge pass.
++    */
++   if (gl_SubgroupID < 2) {
++      uint32_t dst_elem = gl_SubgroupID == 0 ? first_dst_elem : first_dst_elem + items_to_write;
++      uint32_t first_a_index = subgroup_find_first_src_elem(src_a_start, src_a_len, src_b_start, src_b_len,
++                                                            dst_elem, src);
++      if (subgroupElect()) {
++         if (gl_SubgroupID == 0) {
++            shared_first_a_index = first_a_index;
++            shared_first_b_index = first_dst_elem - first_a_index;
++         } else {
++            shared_next_a_index = first_a_index;
++            shared_next_b_index = (first_dst_elem + items_to_write) - first_a_index;
++         }
++      }
+    }
+ 
+    barrier();

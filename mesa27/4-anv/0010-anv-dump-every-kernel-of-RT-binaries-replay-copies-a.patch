@@ -1,0 +1,162 @@
+From 627e5a3dec73c83b181b8b99fdec00f48458375e Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:02:26 -0300
+Subject: [PATCH 10/10] anv: dump every kernel of RT binaries, replay copies
+ and internal kernels
+
+ANV_DEBUG=shader-dump only wrote the first kernel of ray-tracing
+binaries (not the resume shaders), not the capture/replay copies the
+RT handles point at, and no internal kernels, so EU stall samples
+could not be mapped to them.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit aa2d70b8c2d2f0440fd583d939b32cf70435c43e)
+---
+ src/intel/vulkan/anv_pipeline_cache.c |  3 ++
+ src/intel/vulkan/anv_private.h        |  4 ++
+ src/intel/vulkan/anv_shader.c         | 72 ++++++++++++++++++++++++---
+ 3 files changed, 71 insertions(+), 8 deletions(-)
+
+diff --git a/src/intel/vulkan/anv_pipeline_cache.c b/src/intel/vulkan/anv_pipeline_cache.c
+index 70bde000d44..a5dd39ed114 100644
+--- a/src/intel/vulkan/anv_pipeline_cache.c
++++ b/src/intel/vulkan/anv_pipeline_cache.c
+@@ -151,6 +151,9 @@ anv_shader_internal_create(struct anv_device *device,
+    anv_shader_heap_upload(&device->shader_heap, shader->kernel,
+                           shader->code, kernel_size);
+ 
++   anv_device_dump_internal_kernel(device, shader->code, kernel_size,
++                                   shader->kernel.offset, stage);
++
+    return shader;
+ }
+ 
+diff --git a/src/intel/vulkan/anv_private.h b/src/intel/vulkan/anv_private.h
+index c9ca5d09da3..cbe96a6f5d7 100644
+--- a/src/intel/vulkan/anv_private.h
++++ b/src/intel/vulkan/anv_private.h
+@@ -1250,6 +1250,10 @@ void anv_shader_heap_upload(struct anv_shader_heap *heap,
+ 
+ VkResult anv_device_init_shader_dump(struct anv_device *device);
+ void anv_device_finish_shader_dump(struct anv_device *device);
++void anv_device_dump_internal_kernel(struct anv_device *device,
++                                     const void *code, uint32_t size,
++                                     uint64_t kernel_offset,
++                                     mesa_shader_stage stage);
+ 
+ struct anv_shader_group_rt_replay {
+    uint64_t general;
+diff --git a/src/intel/vulkan/anv_shader.c b/src/intel/vulkan/anv_shader.c
+index b969248d33b..325c33cb769 100644
+--- a/src/intel/vulkan/anv_shader.c
++++ b/src/intel/vulkan/anv_shader.c
+@@ -79,7 +79,8 @@ static void
+ anv_device_dump_shader_variant(struct anv_device *device,
+                                struct anv_shader *shader,
+                                const char *variant,
+-                               uint32_t code_offset)
++                               uint32_t code_offset,
++                               uint64_t kernel_offset)
+ {
+    const struct intel_device_info *devinfo =
+       device->physical->compiler->isa.devinfo;
+@@ -101,9 +102,30 @@ anv_device_dump_shader_variant(struct anv_device *device,
+               shader->prog_data->source_hash);
+    }
+ 
+-   anv_dump_shader_assembly(f, devinfo, shader->code, code_offset,
+-                            shader->prog_data->program_size,
+-                            GEN_PRINT_BYTE_OFFSETS, shader->kernel.offset);
++   if (mesa_shader_stage_is_rt(shader->vk.stage)) {
++      /* A ray-tracing binary holds the shader followed by its resume
++       * kernels (64-byte aligned) and then the resume SBT: dump them all.
++       */
++      const struct brw_bs_prog_data *bs_prog_data =
++         brw_bs_prog_data_const(shader->prog_data);
++      const int end = bs_prog_data->resume_sbt_offset > 0 ?
++         MIN2(bs_prog_data->resume_sbt_offset,
++              shader->prog_data->program_size) :
++         shader->prog_data->program_size;
++      for (int start = code_offset; start < end;) {
++         const int size = gen_find_shader_size(devinfo, shader->code,
++                                               start, end);
++         if (size <= 0)
++            break;
++         anv_dump_shader_assembly(f, devinfo, shader->code, start, end,
++                                  GEN_PRINT_BYTE_OFFSETS, kernel_offset);
++         start = align(start + size, 64);
++      }
++   } else {
++      anv_dump_shader_assembly(f, devinfo, shader->code, code_offset,
++                               shader->prog_data->program_size,
++                               GEN_PRINT_BYTE_OFFSETS, kernel_offset);
++   }
+ 
+    if (device->shader_dump.archive != NULL)
+       debug_archiver_finish_file(device->shader_dump.archive);
+@@ -111,6 +133,33 @@ anv_device_dump_shader_variant(struct anv_device *device,
+    simple_mtx_unlock(&device->shader_dump.mutex);
+ }
+ 
++/* Internal kernels (blorp, internal compute kernels, the RT trampoline...)
++ * share the shader heap; dump them too so EU stall samples can be mapped.
++ */
++void
++anv_device_dump_internal_kernel(struct anv_device *device, const void *code,
++                                uint32_t size, uint64_t kernel_offset,
++                                mesa_shader_stage stage)
++{
++   if (!ANV_DEBUG(SHADER_DUMP) || device->shader_dump.archive == NULL)
++      return;
++
++   const struct intel_device_info *devinfo =
++      device->physical->compiler->isa.devinfo;
++
++   simple_mtx_lock(&device->shader_dump.mutex);
++
++   char filename[80];
++   snprintf(filename, sizeof(filename), "0x%016"PRIx64"-%s-internal",
++            kernel_offset, _mesa_shader_stage_to_abbrev(stage));
++   FILE *f = debug_archiver_start_file(device->shader_dump.archive, filename);
++   anv_dump_shader_assembly(f, devinfo, code, 0, size,
++                            GEN_PRINT_BYTE_OFFSETS, kernel_offset);
++   debug_archiver_finish_file(device->shader_dump.archive);
++
++   simple_mtx_unlock(&device->shader_dump.mutex);
++}
++
+ static void
+ anv_device_maybe_dump_shader(struct anv_device *device, struct anv_shader *shader)
+ {
+@@ -125,13 +174,13 @@ anv_device_maybe_dump_shader(struct anv_device *device, struct anv_shader *shade
+       const struct brw_fs_prog_data *fs_prog_data = get_shader_fs_prog_data(shader);
+ 
+       if (fs_prog_data->dispatch_8 || fs_prog_data->dispatch_multi)
+-         anv_device_dump_shader_variant(device, shader, "-8", 0);
++         anv_device_dump_shader_variant(device, shader, "-8", 0, shader->kernel.offset);
+       if (fs_prog_data->dispatch_16)
+-         anv_device_dump_shader_variant(device, shader, "-16", fs_prog_data->prog_offset_16);
++         anv_device_dump_shader_variant(device, shader, "-16", fs_prog_data->prog_offset_16, shader->kernel.offset);
+       if (fs_prog_data->dispatch_32)
+-         anv_device_dump_shader_variant(device, shader, "-32", fs_prog_data->prog_offset_32);
++         anv_device_dump_shader_variant(device, shader, "-32", fs_prog_data->prog_offset_32, shader->kernel.offset);
+    } else {
+-      anv_device_dump_shader_variant(device, shader, "", 0);
++      anv_device_dump_shader_variant(device, shader, "", 0, shader->kernel.offset);
+    }
+ }
+ 
+@@ -1146,6 +1195,13 @@ anv_replay_rt_shader_group(struct vk_device *vk_device,
+                                 shader->prog_data->program_size);
+ 
+          anv_shader_reloc_end(&reloc);
++
++         /* The RT handles point at this copy, so dump it at its own offset
++          * too (EU stall sampling maps instruction pointers to the dump).
++          */
++         if (ANV_DEBUG(SHADER_DUMP))
++            anv_device_dump_shader_variant(device, shader, "-replay", 0,
++                                           shader->replay_kernel.offset);
+       }
+ 
+       simple_mtx_unlock(&shader->replay_mutex);

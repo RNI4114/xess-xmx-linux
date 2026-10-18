@@ -1,0 +1,60 @@
+From 996d7b29263cfd4b616f0c4b385e82a201226474 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:02:26 -0300
+Subject: [PATCH 21/21] nir/lower_shader_calls: make scratch_size the largest
+ call frame
+
+nir_opt_sort_and_pack_stack() assigned shader->scratch_size inside the
+per-call loop, so it ended up as the last call's stack size instead of
+the largest one, and drivers reported a too small shader stack size.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 7ea90c374d8ab3f1490293cc3dda05ec734d2c6f)
+---
+ src/compiler/nir/nir_lower_shader_calls.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/compiler/nir/nir_lower_shader_calls.c b/src/compiler/nir/nir_lower_shader_calls.c
+index a626491b49a..b1d024731a9 100644
+--- a/src/compiler/nir/nir_lower_shader_calls.c
++++ b/src/compiler/nir/nir_lower_shader_calls.c
+@@ -1595,6 +1595,11 @@ nir_opt_sort_and_pack_stack(nir_shader *shader,
+    struct util_dynarray ops;
+    util_dynarray_init(&ops, mem_ctx);
+ 
++   /* The frame of the shader must hold the spills of every call, not just
++    * those of the last one.
++    */
++   unsigned max_scratch_size = start_call_scratch;
++
+    for (unsigned call_idx = 0; call_idx < num_calls; call_idx++) {
+       _mesa_hash_table_u64_clear(value_id_to_item);
+       util_dynarray_clear(&ops);
+@@ -1647,7 +1652,8 @@ nir_opt_sort_and_pack_stack(nir_shader *shader,
+          scratch_size = item->new_offset + (item->bit_size * item->num_components) / 8;
+          _mesa_hash_table_u64_insert(value_id_to_item, item->value, item);
+       }
+-      shader->scratch_size = align(scratch_size, stack_alignment);
++      const unsigned call_stack_size = align(scratch_size, stack_alignment);
++      max_scratch_size = MAX2(max_scratch_size, call_stack_size);
+ 
+       /* Update offsets in the instructions */
+       nir_foreach_block_safe(block, impl) {
+@@ -1676,7 +1682,7 @@ nir_opt_sort_and_pack_stack(nir_shader *shader,
+             case nir_intrinsic_rt_resume:
+                if (nir_intrinsic_call_idx(intrin) != call_idx)
+                   continue;
+-               nir_intrinsic_set_stack_size(intrin, shader->scratch_size);
++               nir_intrinsic_set_stack_size(intrin, call_stack_size);
+                break;
+ 
+             default:
+@@ -1686,6 +1692,8 @@ nir_opt_sort_and_pack_stack(nir_shader *shader,
+       }
+    }
+ 
++   shader->scratch_size = align(max_scratch_size, stack_alignment);
++
+    ralloc_free(mem_ctx);
+ 
+    nir_shader_preserve_all_metadata(shader);

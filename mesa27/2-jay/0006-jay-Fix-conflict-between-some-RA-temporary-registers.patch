@@ -1,0 +1,23 @@
+From 256d36a50393be546262654967a8b7ca39c240c0 Mon Sep 17 00:00:00 2001
+From: Calder Young <calder.young@intel.com>
+Date: Fri, 14 Aug 2026 18:44:55 -0700
+Subject: [PATCH 06/10] jay: Fix conflict between some RA temporary registers
+
+(cherry picked from commit a29ea805b557704b21e8b7b6a1661aa5d26af8c0)
+---
+ src/intel/compiler/jay/jay_register_allocate.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/intel/compiler/jay/jay_register_allocate.c b/src/intel/compiler/jay/jay_register_allocate.c
+index a9e46211719..5794309e0c4 100644
+--- a/src/intel/compiler/jay/jay_register_allocate.c
++++ b/src/intel/compiler/jay/jay_register_allocate.c
+@@ -348,7 +348,7 @@ mov(jay_builder *b, jay_def dst, jay_def src, struct jay_temp_regs temps)
+ 
+    if (split_copy) {
+       jay_def temp = jay_null(), backing = jay_null();
+-      temp = push_temp(b, temps, GPR, false, &backing, jay_null(), jay_null());
++      temp = push_temp(b, temps, GPR, false, &backing, src, dst);
+       jay_MOV(b, temp, src)->type = acc_src ? JAY_TYPE_F32 : JAY_TYPE_U32;
+       jay_MOV(b, dst, temp)->type = acc_dst ? JAY_TYPE_F32 : JAY_TYPE_U32;
+       pop_temp(b, temp, backing);

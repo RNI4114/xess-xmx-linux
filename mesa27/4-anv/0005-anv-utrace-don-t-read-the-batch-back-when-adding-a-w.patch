@@ -1,0 +1,102 @@
+From a4e3f2bd0e67efe4e4ca2ffc04c73e9dee65c655 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 01:04:58 -0300
+Subject: [PATCH 05/10] anv/utrace: don't read the batch back when adding a
+ walker post-sync timestamp
+
+ANV_TIMESTAMP_REWRITE_COMPUTE_WALKER / _INDIRECT_DISPATCH or-ed the packed
+post-sync into the walker already in the batch, which lives in
+write-combined VRAM: every non-zero dword was read back over PCIe,
+uncached, for every traced dispatch. With MESA_GPU_TRACES=perfetto this
+was ~40% of ANV's CPU time in Cyberpunk.
+
+The walkers ANV emits only set MOCS in their post-sync, to the value the
+rewrite packs too, and the header dword is identical, so store the other
+non-zero dwords instead.
+
+tlascheck with u_trace on (~430 dispatches/frame): process CPU time
+9.36 s -> ~7.6 s over 600 frames (~2.9 ms/frame); traced stage timings
+unchanged, 0 zero-length slices out of 74k.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit c515d2720c3244bc888c24d9c7372cebd11c67c8)
+(cherry picked from commit 46503187c99d6b0fbe9feb2ff5ffff5a5c06c835)
+---
+ src/intel/vulkan/genX_cmd_buffer.c | 36 +++++++++++++++++-------------
+ 1 file changed, 20 insertions(+), 16 deletions(-)
+
+diff --git a/src/intel/vulkan/genX_cmd_buffer.c b/src/intel/vulkan/genX_cmd_buffer.c
+index b2ad1a59103..3d1daf3e5ea 100644
+--- a/src/intel/vulkan/genX_cmd_buffer.c
++++ b/src/intel/vulkan/genX_cmd_buffer.c
+@@ -7855,6 +7855,22 @@ VkResult genX(CmdSetPerformanceStreamMarkerINTEL)(
+ 
+ #define TIMESTAMP 0x2358
+ 
++/* Merge the packed post-sync of a walker into one already in the batch.
++ * The batch lives in write-combined VRAM: the old |= read every dword back
++ * over PCIe, uncached, for every traced dispatch (~40% of ANV's CPU time with
++ * u_trace on). The walkers ANV emits only set MOCS in their post-sync, to
++ * the same value packed here, and dword 0 (the header) is identical, so the
++ * other non-zero dwords can simply be stored.
++ */
++static inline void
++rewrite_walker_postsync(void *data, const uint32_t *dwords, uint32_t count)
++{
++   for (uint32_t i = 1; i < count; i++) {
++      if (dwords[i])
++         ((uint32_t *)data)[i] = dwords[i];
++   }
++}
++
+ void genX(cmd_emit_timestamp)(struct anv_batch *batch,
+                               struct anv_device *device,
+                               struct anv_address addr,
+@@ -7920,10 +7936,7 @@ void genX(cmd_emit_timestamp)(struct anv_batch *batch,
+                }
+             });
+ 
+-         for (uint32_t i = 0; i < ARRAY_SIZE(dwords); i++) {
+-            if (dwords[i])
+-               ((uint32_t *)data)[i] |= dwords[i];
+-         }
++         rewrite_walker_postsync(data, dwords, ARRAY_SIZE(dwords));
+ #endif
+       } else {
+          uint32_t dwords[GENX(COMPUTE_WALKER_length)];
+@@ -7938,10 +7951,7 @@ void genX(cmd_emit_timestamp)(struct anv_batch *batch,
+                }
+             });
+ 
+-         for (uint32_t i = 0; i < ARRAY_SIZE(dwords); i++) {
+-            if (dwords[i])
+-               ((uint32_t *)data)[i] |= dwords[i];
+-         }
++         rewrite_walker_postsync(data, dwords, ARRAY_SIZE(dwords));
+       }
+       break;
+    }
+@@ -7962,10 +7972,7 @@ void genX(cmd_emit_timestamp)(struct anv_batch *batch,
+                }
+             });
+ 
+-         for (uint32_t i = 0; i < ARRAY_SIZE(dwords); i++) {
+-            if (dwords[i])
+-               ((uint32_t *)data)[i] |= dwords[i];
+-         }
++         rewrite_walker_postsync(data, dwords, ARRAY_SIZE(dwords));
+ #endif
+       } else {
+          uint32_t dwords[GENX(EXECUTE_INDIRECT_DISPATCH_length)];
+@@ -7982,10 +7989,7 @@ void genX(cmd_emit_timestamp)(struct anv_batch *batch,
+                }
+             });
+ 
+-         for (uint32_t i = 0; i < ARRAY_SIZE(dwords); i++) {
+-            if (dwords[i])
+-               ((uint32_t *)data)[i] |= dwords[i];
+-         }
++         rewrite_walker_postsync(data, dwords, ARRAY_SIZE(dwords));
+       }
+       break;
+    }

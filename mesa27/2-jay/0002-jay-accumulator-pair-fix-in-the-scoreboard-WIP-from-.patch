@@ -1,0 +1,204 @@
+From d310066ea999f51ea1b2345cd936ef9f7ca8201d Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 18:47:18 -0300
+Subject: [PATCH 02/10] jay: accumulator pair fix in the scoreboard (WIP from
+ xess-xmx-jayfix, committed for the RT series)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit c907ad05a002c1d94409de68e89a6868f6f09ae4)
+---
+ src/intel/compiler/jay/jay_lower_scoreboard.c | 101 ++++++++++++++----
+ 1 file changed, 82 insertions(+), 19 deletions(-)
+
+diff --git a/src/intel/compiler/jay/jay_lower_scoreboard.c b/src/intel/compiler/jay/jay_lower_scoreboard.c
+index c5093e20cdb..7984ba9597c 100644
+--- a/src/intel/compiler/jay/jay_lower_scoreboard.c
++++ b/src/intel/compiler/jay/jay_lower_scoreboard.c
+@@ -568,6 +568,19 @@ max_dependence(gen_pipe pipe)
+                                     11;
+ }
+ 
++/*
++ * RegDist tracking slots: every register file jay_def_to_range covers, plus
++ * one slot for the address register. a0 is written by in-order instructions
++ * (message descriptors, shuffle offsets) and read right after by SENDs and
++ * indirect MOVs, possibly from another pipe, so it needs RegDist tracking like
++ * any other register (brw tracks it as addr_dep).
++ */
++static inline unsigned
++regdist_slots(jay_shader *shader)
++{
++   return jay_range_base(shader, ~0) + 1;
++}
++
+ static void
+ depend_on_writer(struct swsb_regdist_state *state,
+                  struct jay_footprint r,
+@@ -575,9 +588,9 @@ depend_on_writer(struct swsb_regdist_state *state,
+                  gen_pipe exec,
+                  bool except_exec)
+ {
+-   jay_foreach_in_footprint(r, key) {
+-      assert(key < jay_footprint_base(state->shader, ~0));
+-      uint32_t w = state->access[key][0];
++   for (unsigned i = 0; i < r.width; ++i) {
++      assert(r.base + i < regdist_slots(state->shader));
++      uint32_t w = state->access[r.base + i][0];
+       gen_pipe write = writer_pipe(w);
+ 
+       /* We omit write-after-{read,write} dependencies (except_exec) within a
+@@ -596,6 +609,48 @@ depend_on_writer(struct swsb_regdist_state *state,
+ #define jay_foreach_pipe(pipe)                                                 \
+    for (unsigned pipe = 1; pipe < GEN_NUM_PIPES; ++pipe)
+ 
++/*
++ * Flags are scoreboarded per 32-bit physical flag register, as brw does. In
++ * SIMD16 shaders each virtual flag is one 16-bit half (f1.0/f1.1) of a
++ * physical register, and writes to the two halves from different pipes were
++ * left unsynchronized, corrupting predicates. Widen the tracked range to the
++ * whole physical register. a0 gets its own slot (see regdist_slots).
++ */
++static struct jay_range
++regdist_range(jay_function *func, jay_inst *I, jay_def x)
++{
++   struct jay_range r = jay_def_to_range(func, I, x);
++   jay_shader *s = func->shader;
++
++   if (x.file == J_ADDRESS)
++      return (struct jay_range){ jay_range_base(s, ~0), 1 };
++
++   if (x.file == FLAG && r.width && jay_phys_flag_per_virt(s) == 1) {
++      unsigned base = jay_range_base(s, FLAG);
++      unsigned lo = (r.base - base) & ~1u;
++      unsigned hi = MIN2(ALIGN_POT(r.base - base + r.width, 2),
++                         s->num_regs[FLAG]);
++      r.base = base + lo;
++      r.width = hi - lo;
++   }
++
++   /* The integer accumulator of a 32-bit multiply (MUL_32_PART writing acc0,
++    * MACL reading it back) spans two physical accumulators in SIMD16, which
++    * jay_assign_accumulators already models as interference. Track both, or a
++    * float-pipe access to acc1 next to the pair goes unsynchronized and
++    * corrupts the product (seen as exploding vertices in skinning shaders).
++    */
++   if (x.file == ACCUM && r.width && jay_num_accums(s) == 4 &&
++       (I->op == JAY_OPCODE_MUL_32_PART || I->op == JAY_OPCODE_MACL)) {
++      unsigned base = jay_range_base(s, ACCUM);
++      unsigned lo = (r.base - base) & ~1u;
++      r.base = base + lo;
++      r.width = 2;
++   }
++
++   return r;
++}
++
+ static void
+ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+ {
+@@ -604,7 +659,7 @@ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+    jay_def dsts[3] = { I->dst, I->cond_flag };
+ 
+    for (unsigned i = 0; i < ARRAY_SIZE(dsts); ++i) {
+-      struct jay_footprint r = jay_def_to_footprint(func, I, dsts[i], I->type);
++      struct jay_range r = regdist_range(func, I, dsts[i]);
+       depend_on_writer(ctx, r, dep, exec_pipe, true /* except_pipe */);
+ 
+       jay_foreach_in_footprint(r, key) {
+@@ -627,10 +682,8 @@ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+     */
+    jay_foreach_src(I, s) {
+       bool except_pipe = I->src[s].file == ACCUM || I->src[s].file == FLAG;
+-      depend_on_writer(ctx,
+-                       jay_def_to_footprint(func, I, I->src[s],
+-                                            jay_src_type(I, s)),
+-                       dep, exec_pipe, except_pipe);
++      depend_on_writer(ctx, regdist_range(func, I, I->src[s]), dep,
++                       exec_pipe, except_pipe);
+    }
+ 
+    uint32_t wait_pipes = 0;
+@@ -688,17 +741,30 @@ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+     * cause any part of the instruction to get shot down, skipping the sync
+     * for future instructions (at least not without more tricky logic).
+     */
++   const bool xe2 = func->shader->devinfo->ver >= 20;
++
+    if (ctx->last_sync &&
+        jay_sync_op(ctx->last_sync) == TGL_SYNC_NOP &&
+        I->dep.mode == GEN_SBID_NULL &&
+        !I->predication &&
+        !I->simd_split &&
+-       (I->dep.regdist == 0 ||
++       (I->dep.regdist == 0 || xe2 ||
+         jay_inferred_sync_pipe(func->shader->devinfo, I) == I->dep.pipe)) {
+ 
+       assert(ctx->last_sync->dep.regdist == 0);
+       assert(ctx->last_sync->dep.pipe == GEN_PIPE_NONE);
+ 
++      /* A RegDist combined with an SBID wait has no pipe field on Xe2+ other
++       * than RegDistAll: the hardware infers the pipe from the source types
++       * (any 64-bit source -> long pipe, any integer source -> int pipe).
++       * jay_inferred_sync_pipe only looks at the first source and treats
++       * only F64 as long, so e.g. "add.s64 ... {I@1 $2.dst}" would actually
++       * wait on the long pipe and read a stale register. Use A@n instead,
++       * which is always encodable and never weaker.
++       */
++      if (xe2 && I->dep.regdist)
++         I->dep.pipe = GEN_PIPE_ALL;
++
+       I->dep.mode = ctx->last_sync->dep.mode;
+       I->dep.sbid = ctx->last_sync->dep.sbid;
+ 
+@@ -711,8 +777,7 @@ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+       uint32_t now = make_writer(exec_pipe, ctx->ip[exec_pipe]);
+ 
+       for (unsigned i = 0; i < ARRAY_SIZE(dsts); ++i) {
+-         struct jay_footprint r =
+-            jay_def_to_footprint(func, I, dsts[i], I->type);
++         struct jay_range r = regdist_range(func, I, dsts[i]);
+ 
+          jay_foreach_in_footprint(r, key) {
+             ctx->access[key][0] = now;
+@@ -720,11 +785,9 @@ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+       }
+ 
+       jay_foreach_src(I, s) {
+-         struct jay_footprint r =
+-            jay_def_to_footprint(func, I, I->src[s], jay_src_type(I, s));
+-
+-         jay_foreach_in_footprint(r, key) {
+-            ctx->access[key][exec_pipe] = ctx->ip[exec_pipe];
++         struct jay_range r = regdist_range(func, I, I->src[s]);
++         for (unsigned i = 0; i < r.width; ++i) {
++            ctx->access[r.base + i][exec_pipe] = ctx->ip[exec_pipe];
+          }
+       }
+    }
+@@ -778,7 +841,7 @@ void
+ jay_lower_scoreboard(jay_shader *shader)
+ {
+    u32_per_pipe *regdists =
+-      malloc(sizeof(*regdists) * jay_footprint_base(shader, ~0));
++      malloc(sizeof(*regdists) * regdist_slots(shader));
+ 
+    unsigned max_blocks = 0;
+    jay_foreach_function(shader, f)
+@@ -798,7 +861,7 @@ jay_lower_scoreboard(jay_shader *shader)
+ 
+    unsigned dirty_blocks = 0;
+    jay_foreach_function(shader, f) {
+-      memset(regdists, 0, sizeof(*regdists) * jay_footprint_base(shader, ~0));
++      memset(regdists, 0, sizeof(*regdists) * regdist_slots(shader));
+       clear_sbid_state(&sbid_state, dirty_blocks);
+       dirty_blocks = f->num_blocks;
+ 
+@@ -846,7 +909,7 @@ jay_lower_scoreboard(jay_shader *shader)
+       jay_foreach_block(f, block) {
+          if (!list_is_empty(&block->instructions) && next != block) {
+             memset(regdists, 0,
+-                   sizeof(*regdists) * jay_footprint_base(shader, ~0));
++                   sizeof(*regdists) * regdist_slots(shader));
+          }
+ 
+          next = jay_first_successor(block, UGPR);

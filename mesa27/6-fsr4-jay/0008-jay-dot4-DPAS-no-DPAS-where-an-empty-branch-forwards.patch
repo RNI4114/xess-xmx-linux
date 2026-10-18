@@ -1,0 +1,58 @@
+From 68cef5516ef83ca9665cc000b6fe24ff9b530f41 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 17:15:12 -0300
+Subject: [PATCH 8/9] jay: dot4->DPAS, no DPAS where an empty branch forwards
+ values
+
+The non-uniform if around a rewritten block may have an empty other side
+that still carries values to the merge: a phi source from it is live
+there and on no path through this side, so RA can give its register to
+the DPAS destination, and the NoMask write clobbers it for the inactive
+invocations. FSR4's 0058 does this for each 3x3 neighbor (the if
+forwards the previous accumulators when the neighbor is outside the
+image): its outputs differed by 4-7% from the dot products and were not
+deterministic. Require constant or undefined phi sources from the other
+side; of the FSR4 INT8 shaders only 0058 changes (stays dot products in
+those blocks), now bit identical with the pass on and off.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/compiler/jay/jay_nir_dot4_to_dpas.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c b/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c
+index c8fe64ae60b..0d1dca6efd0 100644
+--- a/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c
++++ b/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c
+@@ -387,8 +387,9 @@ lower_block(nir_builder *b, nir_shader *nir, nir_block *block)
+  * are allocated on the logical CFG: in non-uniform control flow that could
+  * clobber a value the inactive invocations still need. That cannot happen
+  * outside loops when every non-uniform if around the block has nothing on
+- * the other side (the bounds check `if (in bounds) { ... }`): a value live in
+- * the inactive invocations is then live after the if, so through the block.
++ * the other side and takes only constants from it at the merge (the bounds
++ * check `if (in bounds) { ... }`): a value live in the inactive invocations is
++ * then live after the if, so through the block.
+  */
+ static bool
+ dpas_safe_in(nir_block *block)
+@@ -417,6 +418,19 @@ dpas_safe_in(nir_block *block)
+                                              exec_list_get_head(other), node));
+       if (!exec_list_is_singular(other) || !exec_list_is_empty(&only->instr_list))
+          return false;
++
++      /* An empty other side can still carry values to the merge: a phi
++       * source from it is live there and nowhere on this side, so its
++       * register can be reused here and the NoMask write would clobber it
++       * (FSR4's 0058: each neighbor's if forwards the previous accumulators).
++       */
++      nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node));
++      nir_foreach_phi(phi, after) {
++         nir_foreach_phi_src(ps, phi) {
++            if (ps->pred == only && !nir_src_is_const(ps->src) && !nir_src_is_undef(ps->src))
++               return false;
++         }
++      }
+    }
+    return true;
+ }

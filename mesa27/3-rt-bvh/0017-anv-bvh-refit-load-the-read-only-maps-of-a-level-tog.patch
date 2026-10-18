@@ -1,0 +1,93 @@
+From ce654c70385b1effe38ce962bdce63c4fef8206a Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:48:20 -0300
+Subject: [PATCH 17/21] anv/bvh: refit: load the read-only maps of a level
+ together
+
+The walk up did parent_child_map -> parent_child_count_map -> atomic ->
+child_block_offset -> ... -> parent_child_map[parent] (again next level)
+as dependent round trips. The maps and the node's child offset don't
+change during a refit: load the count, the grandparent link and the
+child offset together before the atomic, and reuse the grandparent link
+as the next level's parent link.
+
+tlascheck, 141 BLAS refit per frame, clock pinned: 0.467 -> 0.458 ms.
+rtcheck clean.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 436faee1686af7bebde98a1f797917870ee062c4)
+(cherry picked from commit a015fb1bc5c9adaa6640a9d26ea4e6ae99279dc2)
+---
+ src/intel/vulkan/bvh/update.comp | 22 +++++++++++++++-------
+ 1 file changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/src/intel/vulkan/bvh/update.comp b/src/intel/vulkan/bvh/update.comp
+index 0930142fa36..d0de8ad19c4 100644
+--- a/src/intel/vulkan/bvh/update.comp
++++ b/src/intel/vulkan/bvh/update.comp
+@@ -268,7 +268,8 @@ build_and_encode_leaf(uint32_t leaf_local_idx, BLOCK leaf_block)
+ 
+ vk_aabb
+ recompute_parent(BLOCK parent_block, uint32_t updated_idx,
+-                 uint32_t child_count, vk_aabb updated_child_bounds)
++                 uint32_t child_count, vk_aabb updated_child_bounds,
++                 uint32_t child_block_offset)
+ {
+    REF(anv_internal_node) parent = REF(anv_internal_node)(BLOCK_OFFSET(parent_block));
+ 
+@@ -276,7 +277,7 @@ recompute_parent(BLOCK parent_block, uint32_t updated_idx,
+    box.min = vec3(INFINITY);
+    box.max = vec3(-INFINITY);
+ 
+-   BLOCK current_child_block = parent_block + DEREF(parent).child_block_offset;
++   BLOCK current_child_block = parent_block + child_block_offset;
+ 
+    /* Fixed trip counts and constant array indices once unrolled: with the
+     * loops bounded by child_count, cache_aabb[] and quantized_child_bounds[]
+@@ -413,13 +414,20 @@ void main()
+ 
+    BLOCK current_block = leaf_block;
+    vk_aabb current_bounds = leaf_bounds;
++   BLOCK parent_raw = DEREF(INDEX(uint32_t, args.parent_child_map, current_block));
+ 
+    while (true) {
+-      BLOCK parent_raw = DEREF(INDEX(uint32_t, args.parent_child_map, current_block));
+-
+       BLOCK parent = get_parent_id(parent_raw);
++
++      /* The maps and the parent's child offset don't change during a refit:
++       * load them together, before the atomic, instead of one dependent
++       * round trip after another on every level of the walk.
++       */
+       uint32_t valid_child_count =
+          uint32_t(DEREF(INDEX(uint8_t, args.parent_child_count_map, parent)));
++      uint32_t grandparent_raw = DEREF(INDEX(uint32_t, args.parent_child_map, parent));
++      uint32_t child_block_offset =
++         DEREF(REF(anv_internal_node)(BLOCK_OFFSET(parent))).child_block_offset;
+       if (valid_child_count == 0)
+          break;
+ 
+@@ -436,14 +444,13 @@ void main()
+ 
+       uint32_t child_idx = get_child_index(parent_raw);
+       /* Encode and quantize parent bounds */
+-      vk_aabb parent_bounds = recompute_parent(parent, child_idx, valid_child_count, current_bounds);
++      vk_aabb parent_bounds = recompute_parent(parent, child_idx, valid_child_count, current_bounds,
++                                               child_block_offset);
+ 
+       /* Publish parent bounds for next level */
+       arrival = publish_aabb(parent, parent_bounds);
+ 
+       /* Check whether this parent is the root internal node */
+-      uint32_t grandparent_raw = DEREF(INDEX(uint32_t, args.parent_child_map, parent));
+-
+       if (grandparent_raw == VK_NULL_BVH_OFFSET) {
+          REF(anv_accel_struct_header) hdr =
+             REF(anv_accel_struct_header)(args.output_bvh - args.output_bvh_offset);
+@@ -453,5 +460,6 @@ void main()
+ 
+       current_block = parent;
+       current_bounds = parent_bounds;
++      parent_raw = grandparent_raw;
+    }
+ }

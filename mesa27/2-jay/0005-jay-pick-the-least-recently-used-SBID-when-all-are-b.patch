@@ -1,0 +1,47 @@
+From 012c7fa087f3ce0cfcf254255a8246eeea1c9bf8 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:02:26 -0300
+Subject: [PATCH 05/10] jay: pick the least recently used SBID when all are
+ busy
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit ad93ea080f2cbd249064c1b4d4549b33c94e8b6a)
+---
+ src/intel/compiler/jay/jay_lower_scoreboard.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/intel/compiler/jay/jay_lower_scoreboard.c b/src/intel/compiler/jay/jay_lower_scoreboard.c
+index 7984ba9597c..ff44d299bfe 100644
+--- a/src/intel/compiler/jay/jay_lower_scoreboard.c
++++ b/src/intel/compiler/jay/jay_lower_scoreboard.c
+@@ -365,6 +365,12 @@ lower_sbid_local(jay_function *func,
+     */
+    unsigned hash = hash_block_index(block->index);
+ 
++   /* When every SBID is busy, reuse the one set longest ago: its message is
++    * the most likely to have completed, so the implicit wait is the shortest.
++    * SBIDs still busy from predecessor blocks count as oldest (0).
++    */
++   unsigned set_at[32] = { 0 }, clock = 0;
++
+    /* We assign SBIDs as soon as we first reach the block, this avoids any
+     * unnecessary SBID conflicts between edges of a block and it's dominators,
+     * but the back edges of loops are left untended.
+@@ -426,11 +432,16 @@ lower_sbid_local(jay_function *func,
+                   sbid = (roundrobin++ ^ hash) % util_bitcount(free_sbids);
+                   sbid = find_nth_bit(free_sbids, sbid);
+                } else {
+-                  sbid = (roundrobin++ ^ hash) % max_sbids;
++                  sbid = 0;
++                  for (unsigned i = 1; i < max_sbids; i++) {
++                     if (set_at[i] < set_at[sbid])
++                        sbid = i;
++                  }
+                }
+             }
+ 
+             I->dep.sbid = sbid;
++            set_at[sbid] = ++clock;
+          }
+ 
+          if (edge->tokens_bitset[sbid] == NULL) {

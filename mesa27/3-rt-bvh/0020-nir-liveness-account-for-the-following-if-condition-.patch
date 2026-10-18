@@ -1,0 +1,152 @@
+From 28c66a40c17ba9314920cbdaf5292962039b8296 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:02:26 -0300
+Subject: [PATCH 20/21] nir/liveness: account for the following if condition in
+ nir_get_live_defs()
+
+The condition of an if is read at the end of the preceding block but is
+not in that block's live_out.  nir_get_live_defs() ignored it, so
+nir_lower_shader_calls() neither spilled nor rematerialized a value only
+used as the condition of the if right after a trace_ray, and the resume
+shader deleted that if (a raygen loop rendered black on ANV).  Adds unit
+tests.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 151f07013699f1b370b6b5b491f56971303c217e)
+---
+ src/compiler/nir/meson.build              |  1 +
+ src/compiler/nir/nir_liveness.c           | 23 +++++++--
+ src/compiler/nir/tests/liveness_tests.cpp | 59 +++++++++++++++++++++++
+ 3 files changed, 80 insertions(+), 3 deletions(-)
+ create mode 100644 src/compiler/nir/tests/liveness_tests.cpp
+
+diff --git a/src/compiler/nir/meson.build b/src/compiler/nir/meson.build
+index 23e754e18ae..3dceec9d8a5 100644
+--- a/src/compiler/nir/meson.build
++++ b/src/compiler/nir/meson.build
+@@ -442,6 +442,7 @@ if with_tests and not with_nir_headers_only
+           'tests/control_flow_tests.cpp',
+           'tests/core_tests.cpp',
+           'tests/dce_tests.cpp',
++          'tests/liveness_tests.cpp',
+           'tests/format_convert_tests.cpp',
+           'tests/fp_class_tests.cpp',
+           'tests/load_store_vectorizer_tests.cpp',
+diff --git a/src/compiler/nir/nir_liveness.c b/src/compiler/nir/nir_liveness.c
+index a1541fea8af..b6b68231cab 100644
+--- a/src/compiler/nir/nir_liveness.c
++++ b/src/compiler/nir/nir_liveness.c
+@@ -193,12 +193,20 @@ nir_get_live_defs(nir_cursor cursor, void *mem_ctx)
+    ASSERTED nir_function_impl *impl = block->impl;
+    assert(impl->valid_metadata & nir_metadata_live_defs);
+ 
++   /* The condition of an if following the block is read after every
++    * instruction in the block, so it is live at any cursor in the block even
++    * though it is not in the block's live_out.
++    */
++   nir_if *following_if = nir_block_get_following_if(block);
++
+    switch (cursor.option) {
+    case nir_cursor_before_block:
+       return &cursor.block->live_in;
+ 
+    case nir_cursor_after_block:
+-      return &cursor.block->live_out;
++      if (following_if == NULL)
++         return &cursor.block->live_out;
++      break;
+ 
+    case nir_cursor_before_instr:
+       if (cursor.instr == nir_block_first_instr(cursor.instr->block))
+@@ -206,15 +214,24 @@ nir_get_live_defs(nir_cursor cursor, void *mem_ctx)
+       break;
+ 
+    case nir_cursor_after_instr:
+-      if (cursor.instr == nir_block_last_instr(cursor.instr->block))
++      if (cursor.instr == nir_block_last_instr(cursor.instr->block) &&
++          following_if == NULL)
+          return &cursor.instr->block->live_out;
+       break;
+    }
+ 
+-   /* If we got here, we're an instruction cursor mid-block */
++   /* If we got here, we're an instruction cursor mid-block or at the end of
++    * a block followed by an if.
++    */
+    struct u_sparse_bitset *live = rzalloc_size(mem_ctx, sizeof(struct u_sparse_bitset));
+    u_sparse_bitset_dup_with_ctx(live, &block->live_out, mem_ctx);
+ 
++   if (following_if)
++      set_src_live(&following_if->condition, live);
++
++   if (cursor.option == nir_cursor_after_block)
++      return live;
++
+    nir_foreach_instr_reverse(instr, block) {
+       if (cursor.option == nir_cursor_after_instr && instr == cursor.instr)
+          break;
+diff --git a/src/compiler/nir/tests/liveness_tests.cpp b/src/compiler/nir/tests/liveness_tests.cpp
+new file mode 100644
+index 00000000000..6740b4a8059
+--- /dev/null
++++ b/src/compiler/nir/tests/liveness_tests.cpp
+@@ -0,0 +1,59 @@
++/*
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nir_test.h"
++
++class nir_liveness_test : public nir_test {
++protected:
++   nir_liveness_test()
++      : nir_test::nir_test("nir_liveness_test")
++   {
++   }
++
++   bool live_at(nir_cursor cursor, nir_def *def)
++   {
++      nir_metadata_require(b->impl, nir_metadata_block_index |
++                                       nir_metadata_live_defs);
++      return u_sparse_bitset_test(nir_get_live_defs(cursor, b->shader),
++                                  def->index);
++   }
++};
++
++/* A value whose only use is the condition of the if following its block is
++ * live until the end of that block, like nir_defs_interfere() assumes.
++ * nir_lower_shader_calls() relies on this to spill such a value around a
++ * call at the end of the block.
++ */
++TEST_F(nir_liveness_test, following_if_condition_after_last_instr)
++{
++   nir_def *x = nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0));
++   nir_def *cond = nir_ieq_imm(b, x, 0);
++   nir_def *y = nir_load_push_constant(b, 1, 32, nir_imm_int(b, 4));
++
++   nir_push_if(b, cond);
++   nir_use(b, y);
++   nir_pop_if(b, NULL);
++
++   EXPECT_TRUE(live_at(nir_after_instr(nir_def_instr(y)), cond));
++   EXPECT_TRUE(live_at(nir_after_block(nir_def_block(y)), cond));
++   EXPECT_TRUE(live_at(nir_after_instr(nir_def_instr(y)), y));
++   EXPECT_FALSE(live_at(nir_after_instr(nir_def_instr(y)), x));
++}
++
++TEST_F(nir_liveness_test, following_if_condition_mid_block)
++{
++   nir_def *x = nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0));
++   nir_def *cond = nir_ieq_imm(b, x, 0);
++   nir_def *y = nir_load_push_constant(b, 1, 32, nir_imm_int(b, 4));
++   nir_def *z = nir_iadd_imm(b, y, 1);
++
++   nir_push_if(b, cond);
++   nir_use(b, z);
++   nir_pop_if(b, NULL);
++
++   EXPECT_TRUE(live_at(nir_after_instr(nir_def_instr(y)), cond));
++   EXPECT_TRUE(live_at(nir_before_instr(nir_def_instr(z)), cond));
++   EXPECT_FALSE(live_at(nir_after_instr(nir_def_instr(y)), x));
++   EXPECT_FALSE(live_at(nir_after_instr(nir_def_instr(z)), y));
++}

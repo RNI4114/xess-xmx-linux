@@ -1,0 +1,240 @@
+From 40fba17fb81bea1167bab5d6f8f0ad43ec07ba31 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 15:39:30 -0300
+Subject: [PATCH 7/9] jay: dot4->DPAS with uniform weights, when they are
+ reused
+
+The weights may also be uniform values (loads at uniform addresses). A
+is then vec4(gather_lanes_intel(...)), which the backend copies into
+whole GRFs of UGPRs (NoMask) for DPAS to read in place, as for block
+reads. Only when each weight is used at least twice: the dot products
+read uniform weights in place for free, and in FSR4 (each weight used
+once, laid out W[k/4][row][4]) assembling A measured as a loss.
+INTEL_DOT4_DPAS=2 takes them anyway (tests).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/compiler/jay/jay_from_nir.c         |  31 ++++-
+ src/intel/compiler/jay/jay_nir_dot4_to_dpas.c | 111 ++++++++++++++----
+ 2 files changed, 119 insertions(+), 23 deletions(-)
+
+diff --git a/src/intel/compiler/jay/jay_from_nir.c b/src/intel/compiler/jay/jay_from_nir.c
+index 63421362559..4e0e5b56ab8 100644
+--- a/src/intel/compiler/jay/jay_from_nir.c
++++ b/src/intel/compiler/jay/jay_from_nir.c
+@@ -2313,10 +2313,39 @@ jay_emit_dpas(struct nir_to_jay_state *nj, nir_intrinsic_instr *intr)
+    const bool a_ugprs = BITSET_TEST(nj->has_block_ugprs, a->index) &&
+                         a->num_components * nj->s->dispatch_width * 4 == a_bytes;
+ 
++   /* Or A gathered from uniform values, one GRF per component
++    * (vec4(gather_lanes_intel(...)) from jay_nir_dot4_to_dpas): copy them
++    * into whole GRFs of UGPRs instead of the per-lane (masked) gathers.
++    */
++   jay_def a_gathered = jay_null();
++   nir_alu_instr *a_vec = nir_def_as_alu_or_null((nir_def *)a);
++   if (!a_ugprs && a_vec && nir_op_is_vec(a_vec->op) &&
++       a->num_components * nj->s->dispatch_width * 4 == a_bytes &&
++       nj->s->dispatch_width == 16) {
++      jay_def parts[4];
++      bool ok = a->num_components <= 4;
++      for (unsigned i = 0; ok && i < a->num_components; i++) {
++         nir_intrinsic_instr *g = nir_src_as_intrinsic(a_vec->src[i].src);
++         ok = g && g->intrinsic == nir_intrinsic_gather_lanes_intel &&
++              a_vec->src[i].swizzle[0] == 0;
++         if (ok) {
++            parts[i] = nj_src(g->src[0]);
++            ok = parts[i].file == UGPR && jay_num_values(parts[i]) == 16;
++         }
++      }
++      if (ok) {
++         a_gathered = jay_alloc_def(b, UGPR, 16 * a->num_components);
++         for (unsigned i = 0; i < a->num_components; i++)
++            jay_copy(b, jay_extract_range(a_gathered, i * 16, 16), parts[i]);
++      }
++   }
++
+    jay_def src[3] = {
+       src0_use_null ? jay_null() : jay_as_gpr(b, nj_src(intr->src[0])),
+       jay_as_gpr(b, nj_src(intr->src[1])),
+-      a_ugprs ? nj->block_ugprs[a->index] : jay_as_gpr(b, nj_src(intr->src[2])),
++      a_ugprs ? nj->block_ugprs[a->index] :
++      !jay_is_null(a_gathered) ? a_gathered :
++                                 jay_as_gpr(b, nj_src(intr->src[2])),
+    };
+ 
+    jay_DPAS(b, dst, src[0], src[1], src[2], nir_intrinsic_systolic_depth(intr),
+diff --git a/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c b/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c
+index 6e338c944f3..c8fe64ae60b 100644
+--- a/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c
++++ b/src/intel/compiler/jay/jay_nir_dot4_to_dpas.c
+@@ -25,14 +25,17 @@
+  *
+  * The shader is pinned to SIMD16 (where the layouts match one to one); shaders
+  * that require another subgroup size, and can tell, are left alone.
+- * INTEL_DOT4_DPAS=0 turns the pass off.
++ * INTEL_DOT4_DPAS=0 turns the pass off, 2 also takes uniform weights that are
++ * not reused (tests).
+  *
+- * brw_nir_opt_systolic_vectorize does the same for weights loaded from an
+- * SSBO (XeSS); this handles weights that are constants.
++ * Weights may also be uniform values (loaded from a buffer at uniform
++ * addresses), gathered into A. brw_nir_opt_systolic_vectorize does something
++ * similar for weights loaded from an SSBO (XeSS), in uniform control flow.
+  */
+ 
+ #include "util/u_dynarray.h"
+ #include "util/hash_table.h"
++#include "util/set.h"
+ #include "util/u_debug.h"
+ #include "compiler/nir/nir_builder.h"
+ #include "intel/compiler/intel_shader.h"
+@@ -44,7 +47,7 @@
+ struct dot {
+    nir_alu_instr *alu;
+    nir_scalar x;
+-   uint32_t w;
++   nir_scalar w;            /* constant or uniform */
+    unsigned index;          /* position in the block */
+ };
+ 
+@@ -61,7 +64,7 @@ is_dot_op(nir_op op)
+    return op == nir_op_sdot_4x8_iadd || op == nir_op_udot_4x8_uadd;
+ }
+ 
+-/* The dot product of a non-constant dword against a constant one */
++/* The dot product of a dword against a constant or uniform one (the weight) */
+ static bool
+ match_dot(nir_alu_instr *alu, struct dot *d)
+ {
+@@ -69,17 +72,25 @@ match_dot(nir_alu_instr *alu, struct dot *d)
+        alu->def.num_components != 1)
+       return false;
+ 
+-   nir_scalar s0 = nir_scalar_chase_movs(nir_get_scalar(alu->src[0].src.ssa, alu->src[0].swizzle[0]));
+-   nir_scalar s1 = nir_scalar_chase_movs(nir_get_scalar(alu->src[1].src.ssa, alu->src[1].swizzle[0]));
+-   if (nir_scalar_is_const(s1) && !nir_scalar_is_const(s0)) {
+-      d->x = s0;
+-      d->w = nir_scalar_as_uint(s1);
+-   } else if (nir_scalar_is_const(s0) && !nir_scalar_is_const(s1)) {
+-      d->x = s1;
+-      d->w = nir_scalar_as_uint(s0);
+-   } else {
++   nir_scalar s[2];
++   for (unsigned i = 0; i < 2; i++)
++      s[i] = nir_scalar_chase_movs(nir_get_scalar(alu->src[i].src.ssa, alu->src[i].swizzle[0]));
++
++   const bool c0 = nir_scalar_is_const(s[0]), c1 = nir_scalar_is_const(s[1]);
++   unsigned w;
++   if (c0 != c1)
++      w = c1 ? 1 : 0;
++   else if (c0)
+       return false;
+-   }
++   else if (!s[1].def->divergent)
++      w = 1;
++   else if (!s[0].def->divergent)
++      w = 0;
++   else
++      return false;
++
++   d->x = s[1 - w];
++   d->w = s[w];
+    d->alu = alu;
+    return true;
+ }
+@@ -180,17 +191,43 @@ lower_group(nir_builder *b, nir_shader *nir, struct chain **rows, unsigned nrows
+           * an int8 8x32 A (GRF i) holds, in invocation l, dword (l % 8) of row
+           * 2 * i + l / 8.
+           */
+-         uint32_t a[4][16];
+-         for (unsigned i = 0; i < 4; i++) {
+-            for (unsigned l = 0; l < 16; l++) {
+-               const unsigned r = r0 + 2 * i + l / 8, k = k0 + l % 8;
+-               a[i][l] = (r < nrows && k < K) ? rows[r]->dots[k].w : 0;
++         bool all_const = true;
++         for (unsigned r = r0; r < MIN2(r0 + DPAS_ROWS, nrows); r++) {
++            for (unsigned k = k0; k < MIN2(k0 + DPAS_DEPTH, K); k++)
++               all_const &= nir_scalar_is_const(rows[r]->dots[k].w);
++         }
++
++         nir_def *A;
++         if (all_const) {
++            uint32_t a[4][16];
++            for (unsigned i = 0; i < 4; i++) {
++               for (unsigned l = 0; l < 16; l++) {
++                  const unsigned r = r0 + 2 * i + l / 8, k = k0 + l % 8;
++                  a[i][l] = (r < nrows && k < K) ? nir_scalar_as_uint(rows[r]->dots[k].w) : 0;
++               }
+             }
++            A = load_a(b, nir, a);
++         } else {
++            /* Uniform weights: gather each GRF of A from them. The backend
++             * reads the gathered values in place (as for the block read).
++             */
++            nir_def *g[4];
++            nir_scalar zero_s = nir_get_scalar(zero, 0);
++            for (unsigned i = 0; i < 4; i++) {
++               nir_scalar lanes[16];
++               for (unsigned l = 0; l < 16; l++) {
++                  const unsigned r = r0 + 2 * i + l / 8, k = k0 + l % 8;
++                  lanes[l] = (r < nrows && k < K) ? rows[r]->dots[k].w : zero_s;
++               }
++               nir_def *v = nir_vec_scalars(b, lanes, 16);
++               g[i] = nir_gather_lanes_intel(b, v, v);
++            }
++            A = nir_vec(b, g, 4);
+          }
+ 
+          nir_def *d = nir_dpas_intel(b, 32, nir_vec(b, acc, DPAS_ROWS),
+                                      nir_vec(b, x, DPAS_DEPTH),
+-                                     load_a(b, nir, a),
++                                     A,
+                                      .dest_base_type = is_signed ? GLSL_TYPE_INT : GLSL_TYPE_UINT,
+                                      .src_base_type = is_signed ? GLSL_TYPE_INT8 : GLSL_TYPE_UINT8,
+                                      .saturate = false,
+@@ -232,6 +269,36 @@ lower_block(nir_builder *b, nir_shader *nir, nir_block *block)
+       ralloc_free(mem);
+       return false;
+    }
++
++   /* Uniform (non-constant) weights pay off only when reused: the dot
++    * products read them in place, while A has to be assembled from them. In
++    * FSR4 every weight is used once (and its layout does not fit A), which
++    * measured as a loss. Drop them unless each is used at least twice.
++    */
++   {
++      struct set *wset = _mesa_set_create(mem, _mesa_hash_pointer, _mesa_key_pointer_equal);
++      unsigned nu = 0;
++      util_dynarray_foreach(&dots, struct dot, d) {
++         if (!nir_scalar_is_const(d->w)) {
++            nu++;
++            _mesa_set_add(wset, (void *)(uintptr_t)((uintptr_t)d->w.def * 4 + d->w.comp));
++         }
++      }
++      if (nu && nu < 2 * wset->entries &&
++          debug_get_num_option("INTEL_DOT4_DPAS", 1) < 2) {
++         unsigned j = 0;
++         struct dot *all_d = dots.data;
++         util_dynarray_foreach(&dots, struct dot, d) {
++            if (nir_scalar_is_const(d->w))
++               all_d[j++] = *d;
++         }
++         dots.size = j * sizeof(struct dot);
++         if (j < 32) {
++            ralloc_free(mem);
++            return false;
++         }
++      }
++   }
+    util_dynarray_foreach(&dots, struct dot, d)
+       _mesa_hash_table_insert(dot_of, &d->alu->def, d);
+ 
+@@ -388,7 +455,7 @@ bool
+ jay_nir_dot4_to_dpas(nir_shader *nir, const struct intel_device_info *devinfo)
+ {
+    if (devinfo->ver < 20 || nir->info.stage != MESA_SHADER_COMPUTE ||
+-       !debug_get_bool_option("INTEL_DOT4_DPAS", true))
++       debug_get_num_option("INTEL_DOT4_DPAS", 1) == 0)
+       return false;
+ 
+    /* SIMD16 only: leave shaders that require another subgroup size, unless

@@ -1,0 +1,93 @@
+From 5c4ac4a5a390264af17a84b39b2fd2dcf9a91399 Mon Sep 17 00:00:00 2001
+From: Calder Young <calder.young@intel.com>
+Date: Thu, 1 Oct 2026 14:57:58 -0700
+Subject: [PATCH 01/10] jay: Fix a SWSB issue with nested loops
+
+Yes, we did in fact need a fixed point approach...
+
+Signed-off-by: Calder Young <calder.young@intel.com>
+(cherry picked from commit 66bd5514c6f1426280b01dbb21a17342646e341b)
+---
+ src/intel/compiler/jay/jay_lower_scoreboard.c | 52 ++++++++++++++++---
+ 1 file changed, 45 insertions(+), 7 deletions(-)
+
+diff --git a/src/intel/compiler/jay/jay_lower_scoreboard.c b/src/intel/compiler/jay/jay_lower_scoreboard.c
+index 26c8de8ba26..c5093e20cdb 100644
+--- a/src/intel/compiler/jay/jay_lower_scoreboard.c
++++ b/src/intel/compiler/jay/jay_lower_scoreboard.c
+@@ -205,9 +205,44 @@ store_sbid_edge(struct swsb_sbid_edge *dst, const struct swsb_sbid_edge *src)
+    validate_edge(dst);
+ }
+ 
+-/** Merges bits from src into dst, returns true if dst changed */
++/** Check for equivelance between two edges */
+ static inline bool
+-merge_bitsets(BITSET_WORD *dst, const BITSET_WORD *src, unsigned words)
++compare_sbid_edges(const struct swsb_sbid_edge *a,
++                   const struct swsb_sbid_edge *b) {
++   validate_edge(a);
++   validate_edge(b);
++   uint32_t busy = 0;
++
++   if (a->tdr_state != b->tdr_state) {
++      return false;
++   }
++
++   jay_foreach_sbid_dep_type(type) {
++      if (a->tokens_busy[type] != b->tokens_busy[type]) {
++         return false;
++      }
++
++      busy |= a->tokens_busy[type];
++   }
++
++   u_foreach_bit(sbid, busy) {
++      jay_foreach_sbid_dep_type(type) {
++         if ((a->tokens_busy[type] & BITFIELD_BIT(sbid)) &&
++             memcmp(bitset_for(a, sbid, type), bitset_for(b, sbid, type),
++                    a->ctx->words * sizeof(BITSET_WORD))) {
++            return false;
++         }
++      }
++   }
++
++   return true;
++}
++
++/** Merges two edges together and stores the result in out */
++static inline void
++merge_sbid_edges(const struct swsb_sbid_edge *a,
++                 const struct swsb_sbid_edge *b,
++                 struct swsb_sbid_edge *out)
+ {
+    BITSET_WORD changed = 0;
+ 
+@@ -774,12 +809,14 @@ jay_lower_scoreboard(jay_shader *shader)
+       /* Propagate SBID dependencies until a fixed point is reached */
+       while (!u_worklist_is_empty(&sbid_worklist)) {
+          jay_block *block = jay_worklist_pop_tail(&sbid_worklist);
+-         store_sbid_edge(&sbid_state.tmp, &sbid_state.edges[block->index]);
++         struct swsb_sbid_edge *edge = &sbid_state.edges[block->index];
++         merge_sbid_edges_of_preds(&sbid_state, block, &sbid_state.tmp);
+          lower_sbid_local(f, block, &sbid_state.tmp, false);
+ 
+-         jay_foreach_successor(block, succ, UGPR) {
+-            struct swsb_sbid_edge *edge = &sbid_state.edges[(*succ)->index];
+-            if (merge_sbid_edges(edge, &sbid_state.tmp)) {
++         if (!compare_sbid_edges(&sbid_state.tmp, edge)) {
++            SWAP(sbid_state.tmp, *edge);
++
++            jay_foreach_successor(block, succ, UGPR) {
+                jay_worklist_push_tail(&sbid_worklist, *succ);
+             }
+          }
+@@ -787,7 +824,8 @@ jay_lower_scoreboard(jay_shader *shader)
+ 
+       /* Apply the finished SBID dependencies to the program */
+       jay_foreach_block(f, block) {
+-         lower_sbid_local(f, block, &sbid_state.edges[block->index], true);
++         merge_sbid_edges_of_preds(&sbid_state, block, &sbid_state.tmp);
++         lower_sbid_local(f, block, &sbid_state.tmp, true);
+       }
+ 
+       struct swsb_regdist_state regdist_state = {

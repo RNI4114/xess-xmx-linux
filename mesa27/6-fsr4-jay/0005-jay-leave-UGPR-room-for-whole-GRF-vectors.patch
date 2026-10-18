@@ -1,0 +1,68 @@
+From 5420e0f575a488b8984b28bf7a699f3727f40e20 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 15:16:27 -0300
+Subject: [PATCH 5/9] jay: leave UGPR room for whole-GRF vectors
+
+With the UGPR partition sized to the demand, every whole-GRF UGPR
+vector (block reads, DPAS A operands read in place) needs RA to open an
+aligned hole: FSR4 INT8's 0058 as compiled in game got 820 UGPR copies
+(4127 instructions, against 2507 with room for two such vectors). Take
+the room when the register file allows it; not for cooperative matrix
+shaders, which measured slightly worse.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/compiler/jay/jay_from_nir.c  |  2 ++
+ src/intel/compiler/jay/jay_ir.h        |  3 +++
+ src/intel/compiler/jay/jay_partition.c | 11 +++++++++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/src/intel/compiler/jay/jay_from_nir.c b/src/intel/compiler/jay/jay_from_nir.c
+index 8ab3d563eef..63421362559 100644
+--- a/src/intel/compiler/jay/jay_from_nir.c
++++ b/src/intel/compiler/jay/jay_from_nir.c
+@@ -5062,6 +5062,8 @@ jay_compile_simd(const struct intel_device_info *devinfo,
+ 
+    jay_shader *s = jay_new_shader(NULL, nir->info.stage);
+    s->dispatch_width = simd_width;
++   s->has_cooperative_matrix = nir->info.stage == MESA_SHADER_COMPUTE &&
++                               nir->info.cs.has_cooperative_matrix;
+    s->scratch_size = align(nir->scratch_size, 4) * s->dispatch_width;
+    s->devinfo = devinfo;
+    s->prog_data = prog_data;
+diff --git a/src/intel/compiler/jay/jay_ir.h b/src/intel/compiler/jay/jay_ir.h
+index 499d10044fd..2987cd52de7 100644
+--- a/src/intel/compiler/jay/jay_ir.h
++++ b/src/intel/compiler/jay/jay_ir.h
+@@ -814,6 +814,9 @@ typedef struct jay_shader {
+    unsigned scratch_size;
+    unsigned payload_gprs, payload_ugprs, push_grfs;
+ 
++   /** Compute shader using cooperative matrices (laid out for their own RA) */
++   bool has_cooperative_matrix;
++
+    /**
+     * In a fragment shader, whether a helper invocation flag is tracked. Flag RA
+     * must reserve the relevant flag.
+diff --git a/src/intel/compiler/jay/jay_partition.c b/src/intel/compiler/jay/jay_partition.c
+index 4041f009235..9b8f869c06c 100644
+--- a/src/intel/compiler/jay/jay_partition.c
++++ b/src/intel/compiler/jay/jay_partition.c
+@@ -425,6 +425,17 @@ jay_partition_grf(jay_shader *shader)
+        * want to take extra UGPRs to reduce shuffling.
+        */
+       unsigned bonus_grfs = 4 * grf_per_gpr;
++
++      /* Whole-GRF UGPR vectors (block reads, DPAS operands read in place) need
++       * an aligned hole each; with the partition sized to the demand, RA
++       * spends hundreds of copies opening one. Leave room for two in flight.
++       * Not for cooperative matrix code, which measured slightly worse.
++       */
++      const unsigned big_grfs = DIV_ROUND_UP(instr_req.ugpr, ugpr_per_grf);
++      if (big_grfs >= 2 && !shader->has_cooperative_matrix &&
++          (uniform_grfs + estimate_nonunif_grf + bonus_grfs + 2 * big_grfs) <= hw_grfs)
++         bonus_grfs += 2 * big_grfs;
++
+       if ((uniform_grfs + estimate_nonunif_grf + bonus_grfs) <= hw_grfs) {
+          uniform_grfs += bonus_grfs;
+       }

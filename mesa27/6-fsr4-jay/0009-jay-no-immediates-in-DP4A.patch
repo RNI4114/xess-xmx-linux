@@ -1,0 +1,54 @@
+From a0531fae03ecbd201f989fc2552c447b6c25e993 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 17:24:52 -0300
+Subject: [PATCH 9/9] jay: no immediates in DP4A
+
+A 16-bit immediate is not the dword DP4A needs for a source of packed
+bytes: a dot product against a constant that fits in 16 bits (0x102 in
+FSR4's 0058) picked up the upper bytes of the other operand. brw never
+propagates immediates into DP4A; do the same.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/compiler/jay/jay_lower_pre_ra.c | 14 ++++++--------
+ 1 file changed, 6 insertions(+), 8 deletions(-)
+
+diff --git a/src/intel/compiler/jay/jay_lower_pre_ra.c b/src/intel/compiler/jay/jay_lower_pre_ra.c
+index 1bd88f52122..f8a115979ba 100644
+--- a/src/intel/compiler/jay/jay_lower_pre_ra.c
++++ b/src/intel/compiler/jay/jay_lower_pre_ra.c
+@@ -152,15 +152,16 @@ lower_immediates(jay_builder *b, jay_inst *I, struct hash_table_u64 *constants)
+ 
+          /* Eligible three-source instructions can have exactly one immediate
+           * (src0 or src2) and it must be 16-bit.
++          *
++          * Not DP4A, as in brw: a 16-bit immediate there is not the zero-extended
++          * dword the dot product of packed bytes needs (FSR4's 0058 has a weight
++          * 0x102, and the result picked up the upper bytes of the other operand).
+           */
+          if (nr_srcs == 3) {
+             unsigned ver = b->shader->devinfo->ver;
+             allowed &= I->op == JAY_OPCODE_BFN ||
+                        I->op == JAY_OPCODE_ADD3 ||
+                        I->op == JAY_OPCODE_MAD ||
+-                       I->op == JAY_OPCODE_DP4A_SS ||
+-                       I->op == JAY_OPCODE_DP4A_SU ||
+-                       I->op == JAY_OPCODE_DP4A_UU ||
+                        (ver >= 12 && I->op == JAY_OPCODE_BFE);
+ 
+             /* Gen9 does not support 3-src immediates */
+@@ -168,12 +169,9 @@ lower_immediates(jay_builder *b, jay_inst *I, struct hash_table_u64 *constants)
+                        !jay_type_is_any_float(I->type) &&
+                        jay_as_uint(I->src[s]) <= UINT16_MAX;
+ 
+-            /* MAD/DP4A can have at most one immediate source on Gfx11 */
++            /* MAD can have at most one immediate source on Gfx11 */
+             allowed &= (ver >= 12 || s == 0 || !jay_is_imm(I->src[0])) ||
+-                       !(I->op == JAY_OPCODE_MAD ||
+-                         I->op == JAY_OPCODE_DP4A_SS ||
+-                         I->op == JAY_OPCODE_DP4A_SU ||
+-                         I->op == JAY_OPCODE_DP4A_UU);
++                       I->op != JAY_OPCODE_MAD;
+          }
+ 
+          /* SENDs have immediate messages descriptors but not payloads */

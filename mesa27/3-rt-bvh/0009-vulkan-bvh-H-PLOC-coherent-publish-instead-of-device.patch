@@ -1,0 +1,320 @@
+From 932a7c301f9542fd11d66a3b1b7c60d6039cf04e Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 21:00:59 -0300
+Subject: [PATCH 09/21] vulkan/bvh: H-PLOC: coherent publish instead of device
+ barriers, one node allocation per cluster
+
+The data exchanged between subgroups (ids left for the parent range, bounds
+and flags of created nodes) is accessed coherently and read back before the
+subgroup publishes its range with the next atomicExchange, which depends on
+the read-back. This replaces a device-scope acquire/release barrier per
+cluster (an L1 flush + invalidate of the whole core on Xe2).
+
+Nodes created by a cluster get temporary ids and are allocated with one
+atomicAdd and written once the cluster is done, instead of one global atomic
+per merge iteration. Creation order is kept (children before parents, root
+last).
+
+TLAS of 43.4k instances on a B580 (tlascheck): H-PLOC ~337 -> ~282 us,
+build 0.61 -> 0.55 ms; host-validated hits identical; rtcheck clean.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 18d5bd935080f7c9b991cc3bd6a773d0cff69914)
+(cherry picked from commit d38e65a070b0d6e8308db32f613ea9ec67342ba1)
+---
+ src/vulkan/runtime/bvh/hploc_internal.comp | 214 +++++++++++++++++----
+ 1 file changed, 175 insertions(+), 39 deletions(-)
+
+diff --git a/src/vulkan/runtime/bvh/hploc_internal.comp b/src/vulkan/runtime/bvh/hploc_internal.comp
+index 669d0ba952c..47d9745503f 100644
+--- a/src/vulkan/runtime/bvh/hploc_internal.comp
++++ b/src/vulkan/runtime/bvh/hploc_internal.comp
+@@ -57,12 +57,117 @@ delta(uint32_t index)
+    }
+ }
+ 
++/* Data exchanged between subgroups: the node ids a cluster leaves in args.ids for its parent range,
++ * and the bounds and flags of the internal nodes it creates. All of it is accessed coherently
++ * (L1-uncached, served by the L3, which is coherent across the GPU), and every store is read back
++ * by the invocation that made it before the subgroup publishes its range with the next
++ * atomicExchange on args.ranges. The read-back only returns once the store reached the L3, and the
++ * exchanged value depends on it, so the exchange cannot overtake the stores. This replaces a
++ * device-scope acquire/release barrier after every cluster, which compiles to an L1 flush and
++ * invalidate of the whole core on some GPUs (Xe2) and sits on the critical path of every level.
++ */
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++coherent buffer coherent_u32_ref {
++   uint32_t value;
++};
++
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++volatile coherent buffer volatile_u32_ref {
++   uint32_t value;
++};
++
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++coherent buffer coherent_aabb_ref {
++   vk_aabb value;
++};
++
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++coherent buffer coherent_box_node_ref {
++   vk_ir_box_node value;
++};
++
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++volatile coherent buffer volatile_box_node_ref {
++   vk_ir_box_node value;
++};
++
++/* The id is the first member of both key/id pairs. */
++uint64_t
++id_addr(uint32_t index)
++{
++   uint32_t stride = VK_TEST_BUILD_FLAG_64BIT_KEYS ? SIZEOF(key64_id_pair) : SIZEOF(key32_id_pair);
++   return OFFSET(args.ids, index * stride);
++}
++
++uint32_t
++load_id(uint32_t index)
++{
++   return DEREF(coherent_u32_ref(id_addr(index)));
++}
++
++/* Stores the id and returns a value that depends on its read-back. */
++uint32_t
++publish_id(uint32_t index, uint32_t id)
++{
++   DEREF(coherent_u32_ref(id_addr(index))) = id;
++   return DEREF(volatile_u32_ref(id_addr(index)));
++}
++
++vk_aabb
++load_node_aabb(uint32_t node_id)
++{
++   return DEREF(coherent_aabb_ref(OFFSET(args.bvh, ir_id_to_offset(node_id))));
++}
++
++uint32_t
++fetch_child_flags_coherent(uint32_t node_id)
++{
++   if (ir_id_to_type(node_id) == vk_ir_node_internal)
++      return DEREF(coherent_box_node_ref(OFFSET(args.bvh, ir_id_to_offset(node_id)))).flags;
++   return fetch_child_flags(args.bvh, node_id);
++}
++
+ #define SEARCH_RADIUS 16
+ 
+ shared uint32_t node_ids[SUBGROUP_SIZE];
+ shared vk_aabb node_aabbs[SUBGROUP_SIZE];
+ shared uint32_t candidate_infos[SUBGROUP_SIZE];
+ 
++/* Nodes created by the current cluster, by creation index (see below). */
++shared uint32_t created_children[SUBGROUP_SIZE][2];
++shared vk_aabb created_aabbs[SUBGROUP_SIZE];
++shared uint32_t created_flags[SUBGROUP_SIZE];
++
++/* Temporary id of the k-th node created by the current cluster. An IR BVH would need ~4 GiB of
++ * internal nodes for a real node id to reach this range.
++ */
++#define TEMP_NODE_ID_BASE 0xffff0000u
++#define TEMP_NODE_ID(k)   (TEMP_NODE_ID_BASE | ((k) << 2) | vk_ir_node_internal)
++
++bool
++is_temp_node_id(uint32_t id)
++{
++   return id != VK_BVH_INVALID_NODE && id >= TEMP_NODE_ID_BASE;
++}
++
++uint32_t
++resolve_node_id(uint32_t id, uint32_t created_base)
++{
++   if (!is_temp_node_id(id))
++      return id;
++   uint32_t k = (id & 0xffffu) >> 2;
++   return pack_ir_node_id(args.internal_node_base + (created_base + k) * SIZEOF(vk_ir_box_node),
++                          vk_ir_node_internal);
++}
++
++uint32_t
++child_flags(uint32_t id)
++{
++   if (is_temp_node_id(id))
++      return created_flags[(id & 0xffffu) >> 2];
++   return fetch_child_flags_coherent(id);
++}
++
+ void
+ main(void)
+ {
+@@ -108,7 +213,14 @@ main(void)
+ 
+    bool is_active = global_id < active_leaf_count;
+ 
++   /* Read-back of everything this invocation stored for the previous clusters, see above. */
++   uint32_t published = 0;
++
+    while (subgroupAny(is_active)) {
++      /* Always 1, but only known once every invocation's read-backs have returned. */
++      uint32_t publish_dep = min(subgroupOr(published), 1u) | 1u;
++      published = 0;
++
+       uint32_t parent_index = 0xffffffff;
+       if (is_active) {
+          /* The parent node has either the index range_start-1 or range_end. Avoid indexing -1 or active_leaf_count. */
+@@ -118,7 +230,8 @@ main(void)
+          if (parent_index == internal_node_count) {
+             is_active = false;
+          } else {
+-            uint32_t prev_range = atomicExchange(DEREF(INDEX(uint32_t, args.ranges, parent_index)), use_right_parent ? range_start : range_end);
++            uint32_t prev_range = atomicExchange(DEREF(INDEX(uint32_t, args.ranges, parent_index)),
++                                                 (use_right_parent ? range_start : range_end) * publish_dep);
+             if (prev_range == 0xffffffff) {
+                is_active = false;
+             } else {
+@@ -159,25 +272,30 @@ main(void)
+          }
+          uint32_t node_id_index = load_base + load_index;
+          uint32_t node_id = VK_BVH_INVALID_NODE;
+-         if (load_index < index_range) {
+-            if (VK_TEST_BUILD_FLAG_64BIT_KEYS) {
+-               node_id = DEREF(INDEX(key64_id_pair, args.ids, node_id_index)).id;
+-	    } else {
+-               node_id = DEREF(INDEX(key32_id_pair, args.ids, node_id_index)).id;
+-	    }
+-	 }
++         if (load_index < index_range)
++            node_id = load_id(node_id_index);
+ 
+          uvec4 node_valid_mask = subgroupBallot(node_id != VK_BVH_INVALID_NODE);
+          uint32_t node_prefix_sum = subgroupBallotExclusiveBitCount(node_valid_mask);
+          uint32_t node_count = subgroupBallotBitCount(node_valid_mask);
+          if (node_id != VK_BVH_INVALID_NODE) {
+             node_ids[node_prefix_sum] = node_id;
+-            node_aabbs[node_prefix_sum] = DEREF(REF(vk_ir_node)(OFFSET(args.bvh, ir_id_to_offset(node_id)))).aabb;
++            node_aabbs[node_prefix_sum] = load_node_aabb(node_id);
+          }
+ 
++         /* Nodes created by this cluster get a temporary id (their creation index) and are only
++          * allocated and written once the cluster is done, with a single atomicAdd for all of them:
++          * one global round trip per cluster instead of one per merge iteration, on the critical path
++          * of every level. Creation order is kept, so children still get lower indices than their
++          * parents and the root is still the last internal node, as the encode expects.
++          */
++         uint32_t created = 0;
+          while (node_count > (range_is_root ? 1 : cluster_threshold)) {
+             node_id = VK_BVH_INVALID_NODE;
+             vk_aabb node_aabb = node_aabbs[gl_SubgroupInvocationID];
++            bool creates = false;
++            uint32_t other_node_id = VK_BVH_INVALID_NODE;
++            vk_aabb merged_bounds;
+             if (gl_SubgroupInvocationID < node_count) {
+                candidate_infos[gl_SubgroupInvocationID] = 0xffffffff;
+                uint32_t best_candidate = 0xffffffff;
+@@ -200,11 +318,10 @@ main(void)
+ 
+                best_candidate = min(best_candidate, candidate_infos[gl_SubgroupInvocationID]);
+                uint32_t best_index = best_candidate & (SUBGROUP_SIZE - 1);
+-               uint32_t other_node_id = node_ids[best_index];
++               other_node_id = node_ids[best_index];
+ 
+-               vk_aabb shared_bounds;
+-               shared_bounds.min = min(node_aabbs[best_index].min, node_aabb.min);
+-               shared_bounds.max = max(node_aabbs[best_index].max, node_aabb.max);
++               merged_bounds.min = min(node_aabbs[best_index].min, node_aabb.min);
++               merged_bounds.max = max(node_aabbs[best_index].max, node_aabb.max);
+ 
+                /* There is always at least on pair of invocations that can be merged because there is a finite number of pairs and
+                 * one of them therefore has a minimum surface area. If more than two nodes have the exact same surface area, the
+@@ -215,28 +332,26 @@ main(void)
+                node_id = node_ids[gl_SubgroupInvocationID];
+ 
+                if (merge) {
+-                  if (gl_SubgroupInvocationID < best_index) {
+-                     uint32_t dst_index = atomicAdd(DEREF(header).ir_internal_node_count, 1);
+-                     uint32_t dst_offset = args.internal_node_base + dst_index * SIZEOF(vk_ir_box_node);
+-
+-                     node_aabb = shared_bounds;
+-
+-                     REF(vk_ir_box_node) node = REF(vk_ir_box_node)(OFFSET(args.bvh, dst_offset));
+-                     DEREF(node).base.aabb = shared_bounds;
+-                     DEREF(node).children[0] = node_id;
+-                     DEREF(node).children[1] = other_node_id;
+-                     DEREF(node).bvh_offset = VK_UNKNOWN_BVH_OFFSET;
+-                     if (VK_TEST_BUILD_FLAG_PROPAGATE_CULL_FLAGS) {
+-                        DEREF(node).flags = fetch_child_flags(args.bvh, node_id) & fetch_child_flags(args.bvh, other_node_id);
+-                     }
+-
+-                     node_id = pack_ir_node_id(dst_offset, vk_ir_node_internal);
+-                  } else {
++                  if (gl_SubgroupInvocationID < best_index)
++                     creates = true;
++                  else
+                      node_id = VK_BVH_INVALID_NODE;
+-                  }
+                }
+             }
+ 
++            uvec4 creates_mask = subgroupBallot(creates);
++            if (creates) {
++               uint32_t k = created + subgroupBallotExclusiveBitCount(creates_mask);
++               created_children[k][0] = node_id;
++               created_children[k][1] = other_node_id;
++               created_aabbs[k] = merged_bounds;
++               if (VK_TEST_BUILD_FLAG_PROPAGATE_CULL_FLAGS)
++                  created_flags[k] = child_flags(node_id) & child_flags(other_node_id);
++               node_id = TEMP_NODE_ID(k);
++               node_aabb = merged_bounds;
++            }
++            created += subgroupBallotBitCount(creates_mask);
++
+             node_count = subgroupBallotBitCount(subgroupBallot(node_id != VK_BVH_INVALID_NODE));
+             uint32_t node_prefix_sum = subgroupBallotExclusiveBitCount(subgroupBallot(node_id != VK_BVH_INVALID_NODE));
+             if (node_id != VK_BVH_INVALID_NODE) {
+@@ -245,17 +360,38 @@ main(void)
+             }
+          }
+ 
++         uint32_t created_base = 0;
++         if (created > 0) {
++            if (subgroupElect())
++               created_base = atomicAdd(DEREF(header).ir_internal_node_count, created);
++            created_base = subgroupBroadcastFirst(created_base);
++         }
++
++         if (gl_SubgroupInvocationID < created) {
++            uint32_t k = gl_SubgroupInvocationID;
++            uint32_t dst_offset = args.internal_node_base + (created_base + k) * SIZEOF(vk_ir_box_node);
++            coherent_box_node_ref node = coherent_box_node_ref(OFFSET(args.bvh, dst_offset));
++            DEREF(node).base.aabb = created_aabbs[k];
++            DEREF(node).children[0] = resolve_node_id(created_children[k][0], created_base);
++            DEREF(node).children[1] = resolve_node_id(created_children[k][1], created_base);
++            DEREF(node).bvh_offset = VK_UNKNOWN_BVH_OFFSET;
++            if (VK_TEST_BUILD_FLAG_PROPAGATE_CULL_FLAGS)
++               DEREF(node).flags = created_flags[k];
++
++            /* Children and bvh_offset are only read by the encode, after a pipeline barrier. */
++            volatile_box_node_ref back = volatile_box_node_ref(OFFSET(args.bvh, dst_offset));
++            vk_aabb back_aabb = DEREF(back).base.aabb;
++            published |= floatBitsToUint(back_aabb.min.x) ^ floatBitsToUint(back_aabb.min.y) ^
++                         floatBitsToUint(back_aabb.min.z) ^ floatBitsToUint(back_aabb.max.x) ^
++                         floatBitsToUint(back_aabb.max.y) ^ floatBitsToUint(back_aabb.max.z);
++            if (VK_TEST_BUILD_FLAG_PROPAGATE_CULL_FLAGS)
++               published |= DEREF(back).flags;
++         }
++
+          if (gl_SubgroupInvocationID < min(end - start + 1, cluster_threshold)) {
+             uint32_t dst_node = gl_SubgroupInvocationID < node_count ? node_ids[gl_SubgroupInvocationID] : VK_BVH_INVALID_NODE;
+-            if (VK_TEST_BUILD_FLAG_64BIT_KEYS) {
+-               DEREF(INDEX(key64_id_pair, args.ids, start + gl_SubgroupInvocationID)).id = dst_node;
+-	    } else {
+-               DEREF(INDEX(key32_id_pair, args.ids, start + gl_SubgroupInvocationID)).id = dst_node;
+-	    }
++            published |= publish_id(start + gl_SubgroupInvocationID, resolve_node_id(dst_node, created_base));
+          }
+-
+-         memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer,
+-                       gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+       }
+    }
+ }

@@ -1,0 +1,55 @@
+From fc47c8efeba070256e4e53227d5bd7b6c9c2e92e Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 23:02:46 -0300
+Subject: [PATCH 12/21] anv/bvh: size parent_child_count_map per block, not per
+ internal node
+
+encode.comp writes parent_child_count_map[bvh_block_offset] and
+update.comp reads it by the parent's block index. Internal nodes and leaves
+share the block numbering, so the index goes up to internal + leaf blocks,
+but the map was sized for internal_count entries: every BLAS built with
+ALLOW_UPDATE wrote up to leaf_count bytes past the size reported by
+vkGetAccelerationStructureBuildSizesKHR.
+
+D3D12 apps (vkd3d-proton) pack acceleration structures back to back, so
+the overrun lands on the next AS header. In Cyberpunk 2077 a per-frame
+ALLOW_UPDATE BLAS rebuild left the neighbour's copy_dispatch_size
+inconsistent with its compacted_size; that field drives the indirect
+dispatch of the compaction copy, and the GPU hangs seen when loading with
+RT on were in copy.comp on the render queue.
+
+Size it like parent_child_map (one entry per block).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Upstream 4f554dafa8d sized it as internal + leaf; this keeps the extra
+entry that parent_child_map also has.
+
+(cherry picked from commit 5206a28dab8d206c81a4fc79c448d60a9b3778d4)
+Upstream 4f554dafa8d sized it as internal + leaf; this keeps the extra
+entry that parent_child_map also has.
+
+(cherry picked from commit 5596e6061e3c792acc20eeef70511a9abe4743e5)
+---
+ src/intel/vulkan/genX_acceleration_structure.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/intel/vulkan/genX_acceleration_structure.c b/src/intel/vulkan/genX_acceleration_structure.c
+index 8d8482bee3f..aed19064591 100644
+--- a/src/intel/vulkan/genX_acceleration_structure.c
++++ b/src/intel/vulkan/genX_acceleration_structure.c
+@@ -324,7 +324,14 @@ get_bvh_layout(const struct vk_acceleration_structure_build_state *state,
+       layout->leaf_block_map_offset = offset;
+       offset += leaf_block_offset_size;
+ 
+-      uint64_t parent_child_count_map_size = (leaf_count + internal_count) * sizeof(uint8_t);
++      /* Indexed by the internal node's block index (encode.comp/update.comp),
++       * and internal nodes and leaves share the block numbering, so this
++       * needs one entry per block like parent_child_map, not per internal
++       * node: sized by internal_count, encode wrote up to leaf_count bytes
++       * past the end of the acceleration structure.
++       */
++      uint64_t parent_child_count_map_size =
++         (internal_count + leaf_count + 1) * sizeof(uint8_t);
+       layout->parent_child_count_map_offset = offset;
+       offset += parent_child_count_map_size;
+    }

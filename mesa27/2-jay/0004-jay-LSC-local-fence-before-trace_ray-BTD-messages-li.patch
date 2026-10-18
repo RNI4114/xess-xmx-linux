@@ -1,0 +1,43 @@
+From 6c03f4aae807f6616bf087680d3d5e70c74121b8 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 16:02:24 -0300
+Subject: [PATCH 04/10] jay: LSC local fence before trace_ray/BTD messages,
+ like brw
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 15f8418eada18d9f2122f27e594d57a2ee84cf89)
+(cherry picked from commit b2745ea179e7ccbb780bfcf8aecc966477bfa337)
+---
+ src/intel/compiler/jay/jay_from_nir.c | 19 +++++++++++++++++--
+ 1 file changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/src/intel/compiler/jay/jay_from_nir.c b/src/intel/compiler/jay/jay_from_nir.c
+index e3e4738cef2..3c59bd10235 100644
+--- a/src/intel/compiler/jay/jay_from_nir.c
++++ b/src/intel/compiler/jay/jay_from_nir.c
+@@ -2103,8 +2103,23 @@ jay_emit_btd_ops(struct nir_to_jay_state *nj, nir_intrinsic_instr *instr)
+                                nir_intrinsic_synchronous(instr) :
+                                false;
+ 
+-   unsigned width = MIN2(s->dispatch_width, 16);
+-   assert(width <= 16 || synchronous);
++   /* Make sure the RT structures and the stack pointer/resume address writes
++    * of this thread are visible to the RT fixed function within the DSS
++    * before the message goes out, like brw does (emit_rt_lsc_fence). The
++    * schedule barrier keeps the message after the fence.
++    */
++   {
++      jay_def notif = jay_alloc_def(&nj->bld, UGPR, jay_ugpr_per_grf(s));
++      uint32_t desc = lsc_fence_msg_desc(s->devinfo, LSC_FENCE_LOCAL,
++                                         LSC_FLUSH_TYPE_NONE, true);
++      jay_SEND(&nj->bld, .sfid = GEN_SFID_UGM, .msg_desc = desc,
++               .srcs = &nj->payload.u0, .nr_srcs = 1, .type = JAY_TYPE_U32,
++               .uniform = true, .dst = notif);
++      jay_SCHEDULE_BARRIER(&nj->bld);
++   }
++
++   assert(nj->s->dispatch_width <= 16 || synchronous);
++   assert(nj->s->dispatch_width <= 16 && "TODO: Ray query SIMD splitting");
+ 
+    uint32_t desc = 0;
+    uint32_t split_len = 0;

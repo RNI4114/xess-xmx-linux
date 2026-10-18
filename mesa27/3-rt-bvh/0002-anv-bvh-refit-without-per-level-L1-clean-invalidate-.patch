@@ -1,0 +1,112 @@
+From 0d2429d54038198c4354d4df20d1589ec9c03307 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 15:49:44 -0300
+Subject: [PATCH 02/21] anv/bvh: refit without per-level L1 clean/invalidate
+ (coherent scratch + read-back ordering)
+
+(cherry picked from commit 8f8d2a5f9f4d3e89e4b035d1f3eef4fdf1b2a752)
+(cherry picked from commit 8d731fa8387830746f305bd1a7b90db778707ef5)
+---
+ src/intel/vulkan/bvh/update.comp | 60 +++++++++++++++++++++++++++-----
+ 1 file changed, 52 insertions(+), 8 deletions(-)
+
+diff --git a/src/intel/vulkan/bvh/update.comp b/src/intel/vulkan/bvh/update.comp
+index 81a88407a16..0eed84280b6 100644
+--- a/src/intel/vulkan/bvh/update.comp
++++ b/src/intel/vulkan/bvh/update.comp
+@@ -60,6 +60,49 @@ load_batch_args()
+ 
+ shared mat4 update_transform;
+ 
++/* The AABB scratch is the only data exchanged between invocations of
++ * different workgroups. Accessing it coherently (L1-uncached, served by the
++ * L3 which is coherent across the GPU) avoids the device-scope
++ * acquire/release on every arrival counter, which compiles to an L1
++ * flush + invalidate of the whole Xe-core per loop iteration and made the
++ * refit slower than a full rebuild. Ordering "my AABB store happens before
++ * my counter increment" only needs a fence that waits for the store to be
++ * acknowledged, not a cache flush.
++ */
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++coherent buffer vk_aabb_coherent_ref {
++   vk_aabb value;
++};
++#define SCRATCH_AABB(i) \
++   DEREF(vk_aabb_coherent_ref(OFFSET(args.aabb_scratch, (i) * SIZEOF(vk_aabb))))
++
++/* Same memory, volatile: the read-back below must not be folded into the
++ * store that precedes it.
++ */
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++volatile coherent buffer vk_aabb_volatile_ref {
++   vk_aabb value;
++};
++
++/* Publish a node's AABB to the scratch and return the arrival counter
++ * increment (always 1). The coherent read-back of the same address only
++ * returns once the store has reached the L3, and the increment depends on
++ * the value read, so the counter atomic cannot overtake the store. This
++ * replaces a device-scope release fence, i.e. an L1 clean of the whole
++ * Xe-core on every level of every leaf's walk.
++ */
++uint32_t
++publish_aabb(uint32_t idx, vk_aabb bounds)
++{
++   SCRATCH_AABB(idx) = bounds;
++   vk_aabb back =
++      DEREF(vk_aabb_volatile_ref(OFFSET(args.aabb_scratch, idx * SIZEOF(vk_aabb))));
++   uint32_t dep = floatBitsToUint(back.min.x) ^ floatBitsToUint(back.min.y) ^
++                  floatBitsToUint(back.min.z) ^ floatBitsToUint(back.max.x) ^
++                  floatBitsToUint(back.max.y) ^ floatBitsToUint(back.max.z);
++   return min(dep, 1u) | 1u;
++}
++
+ vk_ir_triangle_node
+ anv_load_triangle_node(vk_bvh_geometry_data geom_data, uint32_t local_id, out vk_aabb bounds)
+ {
+@@ -238,7 +281,7 @@ recompute_parent(BLOCK parent_block, uint32_t updated_idx,
+    vk_aabb cache_aabb[6];
+    for (uint32_t i = 0; i < child_count; ++i) {
+       cache_aabb[i] = (i == updated_idx) ? updated_child_bounds :
+-                      DEREF(INDEX(vk_aabb, args.aabb_scratch, current_child_block + i));
++                      SCRATCH_AABB(current_child_block + i);
+       aabb_extend(box, cache_aabb[i]);
+    }
+ 
+@@ -353,7 +396,7 @@ void main()
+       return;
+ 
+    vk_aabb leaf_bounds = build_and_encode_leaf(leaf_local, leaf_block);
+-   DEREF(INDEX(vk_aabb, args.aabb_scratch, leaf_block)) = leaf_bounds;
++   uint32_t arrival = publish_aabb(leaf_block, leaf_bounds);
+ 
+    BLOCK current_block = leaf_block;
+    vk_aabb current_bounds = leaf_bounds;
+@@ -367,11 +410,12 @@ void main()
+       if (valid_child_count == 0)
+          break;
+ 
+-      /* Last-child-wins atomic */
++      /* Last-child-wins atomic, ordered after publish_aabb() by data
++       * dependency. The winner reads its siblings' AABBs coherently, after
++       * the atomic returned, so it sees every published sibling.
++       */
+       uint32_t ready = atomicAdd(
+-         DEREF(INDEX(uint32_t, args.internal_ready_count, parent)), 1,
+-         gl_ScopeDevice, gl_StorageSemanticsBuffer,
+-         gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
++         DEREF(INDEX(uint32_t, args.internal_ready_count, parent)), arrival);
+ 
+       /* Not the last child */
+       if (ready != valid_child_count - 1)
+@@ -381,8 +425,8 @@ void main()
+       /* Encode and quantize parent bounds */
+       vk_aabb parent_bounds = recompute_parent(parent, child_idx, valid_child_count, current_bounds);
+ 
+-      /* Store parent bounds for next level */
+-      DEREF(INDEX(vk_aabb, args.aabb_scratch, parent)) = parent_bounds;
++      /* Publish parent bounds for next level */
++      arrival = publish_aabb(parent, parent_bounds);
+ 
+       /* Check whether this parent is the root internal node */
+       uint32_t grandparent_raw = DEREF(INDEX(uint32_t, args.parent_child_map, parent));

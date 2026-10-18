@@ -1,0 +1,82 @@
+From 69a64efa998686facaa6ffb30fd3aef90f7a2d12 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:14:26 -0300
+Subject: [PATCH 15/21] anv/bvh: refit: unroll the per-child loops of
+ recompute_parent
+
+The loops over the children of a refit parent were bounded by the
+dynamic child_count, so cache_aabb[] and quantized_child_bounds[] were
+indexed dynamically. EU stall sampling showed the refit dominated by
+ALU 'active' time with two thirds of the hot code being movs.
+
+Loop over the 6 slots with a fixed trip count (constant indices once
+unrolled) and mask the slots past child_count.
+
+tlascheck, 141 BLAS of 6400 triangles refit per frame, clock pinned:
+0.673 -> 0.466 ms. rtcheck (refit vs rebuild) 2500 frames clean,
+tlascheck 498k rays validated, 0 wrong.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 2646b4dfc635cc5d093e6144e73b531b9462a344)
+(cherry picked from commit 0412a7c2a30c5c5ad4bc9bdfc2de6c1699dda873)
+---
+ src/intel/vulkan/bvh/update.comp | 25 +++++++++++++++++++------
+ 1 file changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/src/intel/vulkan/bvh/update.comp b/src/intel/vulkan/bvh/update.comp
+index 0eed84280b6..0930142fa36 100644
+--- a/src/intel/vulkan/bvh/update.comp
++++ b/src/intel/vulkan/bvh/update.comp
+@@ -278,11 +278,21 @@ recompute_parent(BLOCK parent_block, uint32_t updated_idx,
+ 
+    BLOCK current_child_block = parent_block + DEREF(parent).child_block_offset;
+ 
++   /* Fixed trip counts and constant array indices once unrolled: with the
++    * loops bounded by child_count, cache_aabb[] and quantized_child_bounds[]
++    * were indexed dynamically and the backend spent most of the refit
++    * shuffling registers (two thirds of the hot code were movs).
++    */
+    vk_aabb cache_aabb[6];
+-   for (uint32_t i = 0; i < child_count; ++i) {
+-      cache_aabb[i] = (i == updated_idx) ? updated_child_bounds :
+-                      SCRATCH_AABB(current_child_block + i);
+-      aabb_extend(box, cache_aabb[i]);
++   [[unroll]]
++   for (uint32_t i = 0; i < 6; ++i) {
++      if (i < child_count) {
++         cache_aabb[i] = (i == updated_idx) ? updated_child_bounds :
++                         SCRATCH_AABB(current_child_block + i);
++         aabb_extend(box, cache_aabb[i]);
++      } else {
++         cache_aabb[i] = updated_child_bounds;
++      }
+    }
+ 
+    vk_aabb conservative_child_aabb = conservative_aabb(box);
+@@ -327,13 +337,16 @@ recompute_parent(BLOCK parent_block, uint32_t updated_idx,
+     */
+    uint32_t quantized_child_bounds[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+ 
+-   for (uint32_t i_child = 0; i_child < child_count; i_child++) {
++   [[unroll]]
++   for (uint32_t i_child = 0; i_child < 6; i_child++) {
+       vk_aabb child_bounds = cache_aabb[i_child];
+       vec3 lower = (child_bounds.min - base) / scale;
+       vec3 upper = (child_bounds.max - base) / scale;
+       lower = clamp(floor(lower), vec3(0.0), vec3(255.0));
+       upper = clamp(ceil(upper), vec3(0.0), vec3(255.0));
++      bool valid = i_child < child_count;
+ 
++      [[unroll]]
+       for (uint32_t i_dim = 0; i_dim < 6; i_dim++) {
+          uint32_t idx = i_dim * 6 + i_child;
+          uint32_t i_u32 = idx / 4;
+@@ -341,7 +354,7 @@ recompute_parent(BLOCK parent_block, uint32_t updated_idx,
+          uint32_t val = i_dim % 2 == 1
+             ? uint32_t(upper[i_dim / 2])
+             : uint32_t(lower[i_dim / 2]);
+-         quantized_child_bounds[i_u32] |= val << shift;
++         quantized_child_bounds[i_u32] |= (valid ? val : 0) << shift;
+       }
+    }
+ 

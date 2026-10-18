@@ -1,0 +1,38 @@
+From 1235d0685928a10d6e06020a4e3fc2d5b3abf7ec Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 17:32:31 -0300
+Subject: [PATCH 08/10] anv/xe: make the cross-queue wait experiment (ANV_XQ)
+ opt-in
+
+WuWa hung the render engine inside an xq-ring MI_SEMAPHORE_WAIT whose
+value was never published (devcoredump 2026-10-07 17:26). The experiment
+gave no measurable gain in Cyberpunk, so keep it behind ANV_XQ=1.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/vulkan/xe/anv_batch_chain.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/intel/vulkan/xe/anv_batch_chain.c b/src/intel/vulkan/xe/anv_batch_chain.c
+index aac3c4b0085..1242eba2325 100644
+--- a/src/intel/vulkan/xe/anv_batch_chain.c
++++ b/src/intel/vulkan/xe/anv_batch_chain.c
+@@ -300,7 +300,8 @@ xe_companion_rcs_queue_exec_locked(struct anv_queue *queue,
+  * with 32-bit values. By default only the compute engine polls: on BMG an
+  * active render context (even just polling) makes the compute engine about
+  * 2.5x slower, while a polling compute context does not hurt the render
+- * engine (morta/xqtest). ANV_XQ=0 disables it, ANV_XQ_SAME/ANV_XQ_CROSS=0 each
++ * engine (morta/xqtest). Off by default since a WuWa GPU hang (render engine
++ * stuck in an xq-ring MI_SEMAPHORE_WAIT); ANV_XQ=1 enables it, ANV_XQ_SAME/ANV_XQ_CROSS=0 each
+  * half.
+  */
+ struct anv_xq_sem {
+@@ -319,7 +320,7 @@ struct anv_xq_sem {
+ void
+ anv_xq_init(struct anv_device *device)
+ {
+-   device->xq.enabled = debug_get_bool_option("ANV_XQ", true);
++   device->xq.enabled = debug_get_bool_option("ANV_XQ", false);
+    device->xq.same = debug_get_bool_option("ANV_XQ_SAME", true);
+    device->xq.cross = debug_get_bool_option("ANV_XQ_CROSS", true);
+    simple_mtx_init(&device->xq.mutex, mtx_plain);

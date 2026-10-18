@@ -1,0 +1,34 @@
+From 453f190c5cd720c4a34c84042a25011487694a48 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 15:04:36 -0300
+Subject: [PATCH 02/10] anv/utrace: skip copy/video queues (compute copy
+ fallback hangs bcs)
+
+(cherry picked from commit ea82ec4ccf5a2c46add75c8ec151e01c0f7c1073)
+(cherry picked from commit 3934de9c5839eef31a63a1a3f8f733c6a766571c)
+---
+ src/intel/vulkan/anv_utrace.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/intel/vulkan/anv_utrace.c b/src/intel/vulkan/anv_utrace.c
+index e1126e7ba9f..d9460132f7f 100644
+--- a/src/intel/vulkan/anv_utrace.c
++++ b/src/intel/vulkan/anv_utrace.c
+@@ -160,6 +160,17 @@ anv_device_utrace_flush_cmd_buffers(struct anv_queue *queue,
+                                     struct anv_utrace_submit **out_submit)
+ {
+    struct anv_device *device = queue->device;
++
++   /* The timestamp copies below are only implemented for render/compute
++    * engines; on a copy engine the compute fallback hangs the blitter
++    * (instruction error on CFE_STATE). Don't trace those submissions.
++    */
++   if (queue->family->engine_class != INTEL_ENGINE_CLASS_RENDER &&
++       queue->family->engine_class != INTEL_ENGINE_CLASS_COMPUTE) {
++      *out_submit = NULL;
++      return VK_SUCCESS;
++   }
++
+    uint32_t utrace_copies = 0;
+    uint32_t utraces = command_buffers_count_utraces(device,
+                                                     cmd_buffer_count,

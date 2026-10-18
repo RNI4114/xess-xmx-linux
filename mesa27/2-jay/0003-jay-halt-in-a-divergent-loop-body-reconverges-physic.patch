@@ -1,0 +1,52 @@
+From ba48779cac04ad3578d46ccd84c31ab315719fdc Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 16:02:24 -0300
+Subject: [PATCH 03/10] jay: halt in a divergent loop body reconverges
+ physically at the loop exit
+
+jay_block_reconverge() adds the physical (UGPR) edges of a halt only to the
+convergence blocks in converge_blocks, but the innermost one lives in
+nj->converge_block and is only pushed there when a nested if/loop is
+entered. A halt directly in the body of a divergent loop therefore had no
+physical edge to the loop exit, although the lanes that broke out of the
+loop resume there in the same thread right after the halting lanes are
+disabled.
+
+RA could then reuse UGPRs that are live in the code after the loop. In a
+raytracing resume shader that ends a loop iteration with trace_ray + halt,
+the trace block overwrote the stack IDs copied from r1 that the
+btd_retire after the loop uses, so the wrong stacks were released while
+their rays were still in flight. Stacks got reused, return addresses were
+overwritten and threads spawned garbage shader records: GPU hang in
+Cyberpunk 2077 path tracing (a shadow ray loop with SkipClosestHit, which
+puts lanes from different iterations in the same resume thread).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 5e42eb1da1e2bd944632905681f25d20ae57e24c)
+(cherry picked from commit e23249efcf9477712b8cc4380234e8112524539f)
+---
+ src/intel/compiler/jay/jay_from_nir.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/intel/compiler/jay/jay_from_nir.c b/src/intel/compiler/jay/jay_from_nir.c
+index c9d4a600ead..e3e4738cef2 100644
+--- a/src/intel/compiler/jay/jay_from_nir.c
++++ b/src/intel/compiler/jay/jay_from_nir.c
+@@ -3741,6 +3741,17 @@ jay_block_reconverge(struct nir_to_jay_state *nj,
+           */
+          jay_block_add_successor(current_block, *conv, UGPR);
+       }
++
++      /* The innermost convergence point is not in converge_blocks, it is only
++       * pushed there when entering a nested if/loop. Without this edge a halt
++       * directly in a divergent loop body (e.g. the trace_ray + halt that ends
++       * a raytracing resume shader inside a loop) does not physically fall
++       * through to the loop exit, where the lanes that broke out of the loop
++       * resume, so RA may clobber UGPRs that are still live there (the stack
++       * IDs of btd_retire, which then releases the wrong stacks).
++       */
++      if (nj->converge_block)
++         jay_block_add_successor(current_block, nj->converge_block, UGPR);
+    } else {
+       assert(!jump);
+       jay_block_add_successor(current_block, after_block, GPR);

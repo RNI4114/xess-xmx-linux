@@ -1,0 +1,94 @@
+From de27d16ae0eeb8fe9c5b6cdfc2b35e4d7650465c Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 16:07:39 -0300
+Subject: [PATCH 03/21] anv/bvh: encode without device-scope fences in the spin
+ loop (coherent bvh_offset)
+
+(cherry picked from commit f557b2e9259ee8363c48218e04e9670039e0b39c)
+(cherry picked from commit 71397a1ae1ed66ede0f6712c49b8c3619f3dfe3d)
+---
+ src/intel/vulkan/bvh/encode.comp | 31 +++++++++++++++++++------------
+ 1 file changed, 19 insertions(+), 12 deletions(-)
+
+diff --git a/src/intel/vulkan/bvh/encode.comp b/src/intel/vulkan/bvh/encode.comp
+index 2a48ba79f95..78b79288bde 100644
+--- a/src/intel/vulkan/bvh/encode.comp
++++ b/src/intel/vulkan/bvh/encode.comp
+@@ -32,6 +32,20 @@ layout(push_constant) uniform CONSTS {
+ anv_batch_args args = DEREF(INDEX(anv_batch_args, push_args.batch_args,
+                                   push_args.batch_offset + gl_GlobalInvocationID.y));
+ 
++/* vk_ir_box_node::bvh_offset is the only data passed between invocations of
++ * this dispatch (parent -> child: "encode yourself at this block"). Accessing
++ * it L1-uncached through the L3 instead of with device-scope acquire/release
++ * fences avoids an L1 invalidate of the whole Xe-core on every spin iteration
++ * and an L1 clean after every parent, which dominated encode time on Xe2.
++ * volatile keeps the spin loop re-reading it.
++ */
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++volatile coherent buffer bvh_offset_ref {
++   uint32_t value;
++};
++#define IR_BVH_OFFSET(box_node_addr) \
++   DEREF(bvh_offset_ref(OFFSET(box_node_addr, 32 /* offsetof(vk_ir_box_node, bvh_offset) */)))
++
+ void
+ debug_dump(uint32_t offset, uint32_t value)
+ {
+@@ -340,7 +354,7 @@ find_children(vk_ir_box_node src, inout uint32_t children[6],
+             children[collapsed_child_index] = children[found_child_count];
+          }
+          if (!defer_collapse)
+-            DEREF(child_node).bvh_offset = VK_NULL_BVH_OFFSET;
++            IR_BVH_OFFSET(uint64_t(child_node)) = VK_NULL_BVH_OFFSET;
+       } else
+          break;
+    }
+@@ -382,7 +396,7 @@ main()
+ 
+    if (is_root_node) {
+       /* Tracks BLOCK where the next children should be encoded. */
+-      DEREF(args.header).dst_node_offset = 1;
++      atomicExchange(DEREF(args.header).dst_node_offset, 1);
+       DEREF(header).instance_count = 0;
+       DEREF(header).root_flags = src.flags;
+       if (ANV_TEST_BUILD_FLAG_WRITE_LOOKUP_MAPS_FOR_UPDATE && args.parent_child_map != 0) {
+@@ -429,15 +443,11 @@ main()
+     * or were collapsed (VK_NULL_BVH_OFFSET written) and have no work to do.
+     */
+    for (;;) {
+-      /* Make changes to the current node's BVH offset value visible. */
+-      memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer,
+-                    gl_SemanticsAcquire | gl_SemanticsMakeVisible);
+-
+       /* Indicate where this internal node should be encoded. Offset measured
+        * in number of 64B blocks and started from output_bvh.
+        */
+       if (bvh_block_offset == VK_UNKNOWN_BVH_OFFSET)
+-         bvh_block_offset = DEREF(src_node).bvh_offset;
++         bvh_block_offset = IR_BVH_OFFSET(uint64_t(src_node));
+ 
+       /* The invocation that processes this node is spinning, since its parent
+        * hasn't told it bvh_offset
+@@ -468,7 +478,7 @@ main()
+             if (type == vk_ir_node_internal) {
+                REF(vk_ir_box_node) child_node =
+                   REF(vk_ir_box_node)NODE_OFFSET(children[i]);
+-               DEREF(child_node).bvh_offset = child_offset;
++               IR_BVH_OFFSET(uint64_t(child_node)) = child_offset;
+             }
+             child_offset += (type == vk_ir_node_instance) ? 2 : 1;
+          }
+@@ -479,11 +489,8 @@ main()
+          for (uint32_t i = 0; i < collapsed_child_count; i++) {
+             REF(vk_ir_box_node) child_node =
+                REF(vk_ir_box_node)OFFSET(args.intermediate_bvh, collapsed_nodes[i]);
+-            DEREF(child_node).bvh_offset = VK_NULL_BVH_OFFSET;
++            IR_BVH_OFFSET(uint64_t(child_node)) = VK_NULL_BVH_OFFSET;
+          }
+-         /* Make changes to the children's BVH offset value available to child threads. */
+-         memoryBarrier(gl_ScopeDevice, gl_StorageSemanticsBuffer,
+-                       gl_SemanticsRelease | gl_SemanticsMakeAvailable);
+       }
+ 
+       /* While all work prior was performed with each simd lane working on

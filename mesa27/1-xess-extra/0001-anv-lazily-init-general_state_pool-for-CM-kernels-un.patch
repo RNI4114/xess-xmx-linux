@@ -1,0 +1,71 @@
+From ceee240eb0bbbda061f973b88a1e504889ce8290 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 21:42:16 -0300
+Subject: [PATCH 1/2] anv: lazily init general_state_pool for CM kernels under
+ direct descriptors
+
+ANV's "direct descriptors" model (the default it picks on Xe2+) never
+initializes device->general_state_pool (anv_state_pools_init_direct_descriptors()
+skips it), so the CM kernel injection's indirect-data allocation
+(anv_state_pool_alloc(&device->general_state_pool, ...) in emit_cs_shader)
+crashed inside anv_state_pool_alloc_no_vg on a completely uninitialized pool
+(table.map == NULL, free lists not set to ANV_FREE_LIST_EMPTY) the first time
+a real (non-self-test) CM kernel's pipeline was created.
+
+General State Base Address is still programmed to this same VA range
+unconditionally for every command buffer (fill_state_base_addr() in
+genX_cmd_buffer.c), regardless of descriptor model - only the CPU-side
+anv_state_pool bookkeeping was missing. Initialize it lazily on first CM use,
+guarded by a mutex, with the same params the indirect-descriptors path uses.
+
+Found via the Wuthering Waves self-test (first title confirmed working
+upstream): SR correctly got the extension context and compiled the kernel,
+but vkCreateComputePipelines crashed right after. Confirmed root cause with
+targeted fprintf diagnostics (not a debug build - that triggered an unrelated
+crash-loop and was reverted) showing general_state_pool.table.map == NULL
+while sibling pools (dynamic_state_pool, internal_surface_state_pool) on the
+same device were properly initialized.
+
+(cherry picked from commit d73534e17332aa5c8a6ca7adb02c2fde11295f7e)
+---
+ src/intel/vulkan/genX_shader.c | 27 ++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/src/intel/vulkan/genX_shader.c b/src/intel/vulkan/genX_shader.c
+index ebeb969959f..916f7621e25 100644
+--- a/src/intel/vulkan/genX_shader.c
++++ b/src/intel/vulkan/genX_shader.c
+@@ -1255,7 +1255,32 @@ emit_cs_shader(struct anv_batch *batch,
+ 
+       if (cs_prog_data->uses_cm_kernel) {
+          /* NEO-style payload: [cross-thread data][per-thread data * threads], loaded by the walker from the
+-          * indirect object heap (base address 0, so the general state pool offset is the address). */
++          * indirect object heap (base address 0, so the general state pool offset is the address).
++          *
++          * With "direct descriptors" (the default ANV picks on Xe2+), general_state_pool is never
++          * initialized (anv_state_pools_init_direct_descriptors() skips it entirely) - the software
++          * suballocator simply isn't needed for that descriptor model. But General State Base Address
++          * is still programmed to this same VA range unconditionally for every command buffer (see
++          * fill_state_base_addr() in genX_cmd_buffer.c), so the GPU-visible range is always valid; only
++          * the CPU-side bookkeeping is missing. Initialize it lazily here on first CM use, with the same
++          * params the indirect-descriptors path would have used. */
++         if (p_atomic_read(&device->general_state_pool.table.map) == NULL) {
++            static simple_mtx_t cm_general_pool_mutex = SIMPLE_MTX_INITIALIZER;
++            simple_mtx_lock(&cm_general_pool_mutex);
++            if (device->general_state_pool.table.map == NULL) {
++               VkResult r = anv_state_pool_init(&device->general_state_pool, device,
++                                                &(struct anv_state_pool_params) {
++                                                   .name         = "general pool (xess-xmx-linux CM)",
++                                                   .base_address = 0,
++                                                   .start_offset = device->physical->va.general_state_pool.addr,
++                                                   .block_size   = 16384,
++                                                   .max_size     = device->physical->va.general_state_pool.size,
++                                                });
++               if (r != VK_SUCCESS)
++                  fprintf(stderr, "ANV CM: failed to lazily init general_state_pool: %d\n", r);
++            }
++            simple_mtx_unlock(&cm_general_pool_mutex);
++         }
+          const uint32_t cross = cs_prog_data->cm_cross_thread_size;
+          const uint32_t per = cs_prog_data->cm_per_thread_size;
+          const uint32_t total = cross + per * dispatch.threads;

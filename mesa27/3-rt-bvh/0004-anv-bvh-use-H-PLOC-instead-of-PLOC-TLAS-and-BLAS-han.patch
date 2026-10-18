@@ -1,0 +1,50 @@
+From c452fc07286a296279642c240c962d8f0e5715f7 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 16:14:27 -0300
+Subject: [PATCH 04/21] anv/bvh: use H-PLOC instead of PLOC (TLAS and BLAS);
+ handle HPLOC debug marker
+
+(cherry picked from commit 821cac6c4f9b13e9345c5b1c19502972934177a6)
+(cherry picked from commit f92520d3dfc1321f89ae12174fe76ef173e7c561)
+---
+ src/intel/vulkan/genX_acceleration_structure.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/intel/vulkan/genX_acceleration_structure.c b/src/intel/vulkan/genX_acceleration_structure.c
+index ec75c7c3e4f..43c66a9c6c1 100644
+--- a/src/intel/vulkan/genX_acceleration_structure.c
++++ b/src/intel/vulkan/genX_acceleration_structure.c
+@@ -57,6 +57,7 @@ begin_debug_marker(VkCommandBuffer commandBuffer,
+       trace_intel_begin_as_lbvh_generate_ir(&cmd_buffer->trace);
+       break;
+    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_PLOC_BUILD_INTERNAL:
++   case VK_ACCELERATION_STRUCTURE_BUILD_STEP_HPLOC_BUILD_INTERNAL:
+       trace_intel_begin_as_ploc_build_internal(&cmd_buffer->trace);
+       break;
+    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_PAIR_TRIANGLES:
+@@ -95,6 +96,7 @@ end_debug_marker(VkCommandBuffer commandBuffer,
+       trace_intel_end_as_lbvh_generate_ir(&cmd_buffer->trace);
+       break;
+    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_PLOC_BUILD_INTERNAL:
++   case VK_ACCELERATION_STRUCTURE_BUILD_STEP_HPLOC_BUILD_INTERNAL:
+       trace_intel_end_as_ploc_build_internal(&cmd_buffer->trace);
+       break;
+    case VK_ACCELERATION_STRUCTURE_BUILD_STEP_PAIR_TRIANGLES:
+@@ -352,6 +354,17 @@ anv_get_build_config(VkDevice _device, struct vk_acceleration_structure_build_st
+ 
+    state->config.u64_keys =
+       state->build_info->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
++
++   /* H-PLOC instead of PLOC (RADV does it for the TLAS). PLOC runs a chain
++    * of globally synchronized phases with 1024-wide workgroups: on a B580,
++    * 4x slower for a 150-instance TLAS (which sits on the critical path
++    * between the BLAS builds and the trace rays) and 10x slower for 150
++    * BLAS, with identical hits and no slower traversal in rtcheck.
++    * ANV_BVH_PLOC=1 goes back to PLOC.
++    */
++   if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_PLOC &&
++       !getenv("ANV_BVH_PLOC"))
++      state->config.internal_type = VK_INTERNAL_BUILD_TYPE_HPLOC;
+ }
+ 
+ static void

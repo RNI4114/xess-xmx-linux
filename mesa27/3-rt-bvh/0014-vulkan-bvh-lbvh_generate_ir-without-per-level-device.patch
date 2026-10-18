@@ -1,0 +1,198 @@
+From 26b3671a1ad8668d39fde91ac9dc252ebe1f18bd Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 23:55:34 -0300
+Subject: [PATCH 14/21] vulkan/bvh: lbvh_generate_ir without per-level
+ device-scope fences
+
+Every level of every walk did a device-scope acquire/release atomic on
+path_count plus memoryBarrierBuffer(). On Intel these compile to an L1
+clean + invalidate of the whole Xe-core, per level.
+
+Access the data exchanged between workgroups (the internal nodes written
+by this pass and the child ids in node_info) coherently, i.e. L1-uncached
+and served by the L3, and order 'stores before the increment' by reading
+the stores back and making the increment depend on them, like the ANV
+refit (update.comp) does.
+
+Note: this relies on Intel's coherent (L1 bypass) semantics; for upstream
+it would need to be ANV-only or use the memory model properly.
+
+tlascheck, 51 small BLAS rebuilt per frame (LBVH), clock pinned:
+0.568 -> 0.350 ms. 1.87M validated rays, 0 wrong; rtcheck clean.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 1a385f8b1d3060111eb4cc1ca67b2dc1b62e5c55)
+(cherry picked from commit 660e3e468263e887b86a52a87c08547c1183740d)
+---
+ src/vulkan/runtime/bvh/lbvh_generate_ir.comp | 93 +++++++++++++++-----
+ 1 file changed, 70 insertions(+), 23 deletions(-)
+
+diff --git a/src/vulkan/runtime/bvh/lbvh_generate_ir.comp b/src/vulkan/runtime/bvh/lbvh_generate_ir.comp
+index 71aaa596d01..f5837edb1eb 100644
+--- a/src/vulkan/runtime/bvh/lbvh_generate_ir.comp
++++ b/src/vulkan/runtime/bvh/lbvh_generate_ir.comp
+@@ -31,11 +31,50 @@ layout(local_size_x_id = SUBGROUP_SIZE_ID, local_size_y = 1, local_size_z = 1) i
+ 
+ TYPE(lbvh_node_info, 4);
+ 
++/* Data exchanged between invocations of different workgroups (the internal
++ * nodes written here and the child ids in node_info) is accessed coherently,
++ * i.e. L1-uncached and served by the L3, which is coherent across the GPU.
++ * That replaces the device-scope acquire/release on every path_count atomic
++ * and the memoryBarrierBuffer() of every level, which on Intel compile to an
++ * L1 clean + invalidate of the whole Xe-core per level of every walk.
++ * "My stores happen before my increment" is enforced by reading the stores
++ * back (volatile) and making the increment depend on the values read.
++ */
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++coherent buffer vk_ir_box_node_coherent_ref {
++   vk_ir_box_node value;
++};
++
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++volatile coherent buffer vk_ir_box_node_volatile_ref {
++   vk_ir_box_node value;
++};
++
++layout(buffer_reference, buffer_reference_align = 4, scalar)
++volatile coherent buffer uint32_volatile_ref {
++   uint32_t value;
++};
++
+ layout(push_constant) uniform CONSTS
+ {
+    lbvh_generate_ir_args args;
+ };
+ 
++/* An internal child was written by this dispatch: read it coherently. */
++vk_aabb
++fetch_child_aabb(uint32_t child_id, out uint32_t child_flags)
++{
++   uint32_t child_offset = ir_id_to_offset(child_id);
++   VOID_REF addr = OFFSET(args.bvh, child_offset);
++   if (ir_id_to_type(child_id) == vk_ir_node_internal) {
++      vk_ir_box_node n = vk_ir_box_node_volatile_ref(addr).value;
++      child_flags = n.flags;
++      return n.base.aabb;
++   }
++   child_flags = VK_TEST_BUILD_FLAG_PROPAGATE_CULL_FLAGS ? fetch_child_flags(args.bvh, child_id) : 0;
++   return DEREF(REF(vk_ir_node)(addr)).aabb;
++}
++
+ void
+ main(void)
+ {
+@@ -52,17 +91,17 @@ main(void)
+    previous_bounds.min = vec3(INFINITY);
+    previous_bounds.max = vec3(-INFINITY);
+    uint32_t previous_flags;
++   uint32_t arrival = 1;
+ 
+    for (;;) {
+       uint32_t count = 0;
+ 
+       /* Check if all children have been processed. As this is an atomic the last path coming from
+-       * a child will pass here, while earlier paths break.
++       * a child will pass here, while earlier paths break. Ordered after the
++       * previous level's stores by the data dependency in arrival (always 1).
+        */
+       count = atomicAdd(
+-         DEREF(INDEX(lbvh_node_info, args.node_info, idx)).path_count, 1, gl_ScopeDevice,
+-         gl_StorageSemanticsBuffer,
+-         gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
++         DEREF(INDEX(lbvh_node_info, args.node_info, idx)).path_count, arrival);
+       if (count != 2)
+          break;
+ 
+@@ -74,13 +113,15 @@ main(void)
+       uint32_t current_offset = args.internal_node_base + dst_idx * SIZEOF(vk_ir_box_node);
+       uint32_t current_id = pack_ir_node_id(current_offset, vk_ir_node_internal);
+ 
+-      REF(vk_ir_box_node) node = REF(vk_ir_box_node)(OFFSET(args.bvh, current_offset));
++      VOID_REF node = OFFSET(args.bvh, current_offset);
+       vk_aabb bounds = previous_bounds;
+       uint32_t flags = 0xffffffff;
+ 
+-      lbvh_node_info info = DEREF(INDEX(lbvh_node_info, args.node_info, idx));
+-
+-      uint32_t children[2] = info.children;
++      VOID_REF info_addr = OFFSET(args.node_info, idx * SIZEOF(lbvh_node_info));
++      uint32_t children[2];
++      children[0] = uint32_volatile_ref(OFFSET(info_addr, 4)).value;
++      children[1] = uint32_volatile_ref(OFFSET(info_addr, 8)).value;
++      uint32_t parent = DEREF(INDEX(lbvh_node_info, args.node_info, idx)).parent;
+ 
+       /* Try using the cached previous_bounds instead of fetching the bounds twice. */
+       int32_t previous_child_index = -1;
+@@ -91,14 +132,13 @@ main(void)
+ 
+       if (previous_child_index == -1) {
+          if (children[0] != VK_BVH_INVALID_NODE) {
+-            uint32_t child_offset = ir_id_to_offset(children[0]);
+-            REF(vk_ir_node) child = REF(vk_ir_node)(OFFSET(args.bvh, child_offset));
+-            vk_aabb child_bounds = DEREF(child).aabb;
++            uint32_t child_flags;
++            vk_aabb child_bounds = fetch_child_aabb(children[0], child_flags);
+             bounds.min = min(bounds.min, child_bounds.min);
+             bounds.max = max(bounds.max, child_bounds.max);
+ 
+             if (VK_TEST_BUILD_FLAG_PROPAGATE_CULL_FLAGS)
+-               flags &= fetch_child_flags(args.bvh, children[0]);
++               flags &= child_flags;
+          }
+          previous_child_index = 0;
+       } else {
+@@ -108,14 +148,13 @@ main(void)
+ 
+       /* Fetch the non-cached child */
+       if (children[1 - previous_child_index] != VK_BVH_INVALID_NODE) {
+-         uint32_t child_offset = ir_id_to_offset(children[1 - previous_child_index]);
+-         REF(vk_ir_node) child = REF(vk_ir_node)(OFFSET(args.bvh, child_offset));
+-         vk_aabb child_bounds = DEREF(child).aabb;
++         uint32_t child_flags;
++         vk_aabb child_bounds = fetch_child_aabb(children[1 - previous_child_index], child_flags);
+          bounds.min = min(bounds.min, child_bounds.min);
+          bounds.max = max(bounds.max, child_bounds.max);
+ 
+          if (VK_TEST_BUILD_FLAG_PROPAGATE_CULL_FLAGS)
+-            flags &= fetch_child_flags(args.bvh, children[1 - previous_child_index]);
++            flags &= child_flags;
+       }
+ 
+ 
+@@ -128,20 +167,28 @@ main(void)
+       if (VK_TEST_BUILD_FLAG_PROPAGATE_CULL_FLAGS)
+          node_value.flags = flags;
+ 
+-      DEREF(node) = node_value;
++      vk_ir_box_node_coherent_ref(node).value = node_value;
+ 
+-      if (info.parent == VK_BVH_INVALID_NODE)
++      if (parent == VK_BVH_INVALID_NODE)
+          break;
+ 
+-      idx = info.parent & ~LBVH_RIGHT_CHILD_BIT;
++      idx = parent & ~LBVH_RIGHT_CHILD_BIT;
++
++      VOID_REF slot = OFFSET(args.node_info, idx * SIZEOF(lbvh_node_info) +
++                                             4 + 4 * ((parent >> LBVH_RIGHT_CHILD_BIT_SHIFT) & 1));
++      uint32_volatile_ref(slot).value = current_id;
+ 
+-      DEREF(INDEX(lbvh_node_info, args.node_info, idx))
+-         .children[(info.parent >> LBVH_RIGHT_CHILD_BIT_SHIFT) & 1] = current_id;
++      /* Read both back: the next increment can't overtake these stores. */
++      vk_ir_box_node back = vk_ir_box_node_volatile_ref(node).value;
++      uint32_t dep = uint32_volatile_ref(slot).value ^ back.flags ^
++                     floatBitsToUint(back.base.aabb.min.x) ^ floatBitsToUint(back.base.aabb.min.y) ^
++                     floatBitsToUint(back.base.aabb.min.z) ^ floatBitsToUint(back.base.aabb.max.x) ^
++                     floatBitsToUint(back.base.aabb.max.y) ^ floatBitsToUint(back.base.aabb.max.z) ^
++                     back.children[0] ^ back.children[1];
++      arrival = min(dep, 1u) | 1u;
+ 
+       previous_id = current_id;
+       previous_bounds = bounds;
+       previous_flags = flags;
+-
+-      memoryBarrierBuffer();
+    }
+ }

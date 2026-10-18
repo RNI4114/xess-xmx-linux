@@ -1,0 +1,145 @@
+From 0cd50dae7c40e1f821cbd96ddc77348403939326 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 15:16:27 -0300
+Subject: [PATCH 6/9] jay: optionally do half float compute math in 32 bits
+
+INTEL_PROMOTE_F16=1 (off by default) widens 16-bit float ALU ops of
+compute shaders without cooperative matrices to 32 bits and folds the
+f2f32(f2f16(x)) round trips. Not exact, but it removes the copies
+between dword-strided halves (what float->half conversions and unpacked
+halves give) and the packed halves 3-source half instructions need:
+FSR4's preprocessing goes from 1891 to 1134 instructions.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/compiler/jay/jay_nir.c             |  1 +
+ src/intel/compiler/jay/jay_nir_promote_f16.c | 82 ++++++++++++++++++++
+ src/intel/compiler/jay/jay_private.h         |  1 +
+ src/intel/compiler/jay/meson.build           |  1 +
+ 4 files changed, 85 insertions(+)
+ create mode 100644 src/intel/compiler/jay/jay_nir_promote_f16.c
+
+diff --git a/src/intel/compiler/jay/jay_nir.c b/src/intel/compiler/jay/jay_nir.c
+index 0b8d9089936..074a8958fc6 100644
+--- a/src/intel/compiler/jay/jay_nir.c
++++ b/src/intel/compiler/jay/jay_nir.c
+@@ -995,6 +995,7 @@ jay_process_nir(const struct intel_device_info *devinfo,
+     * handles the weight loads this adds.
+     */
+    JAY_NIR_PASS(jay_nir_dot4_to_dpas, devinfo);
++   JAY_NIR_PASS(jay_nir_promote_f16);
+ 
+    brw_postprocess_nir_opts(pt);
+ }
+diff --git a/src/intel/compiler/jay/jay_nir_promote_f16.c b/src/intel/compiler/jay/jay_nir_promote_f16.c
+new file mode 100644
+index 00000000000..313e9e687b0
+--- /dev/null
++++ b/src/intel/compiler/jay/jay_nir_promote_f16.c
+@@ -0,0 +1,82 @@
++/*
++ * Copyright 2026 Intel Corporation
++ * SPDX-License-Identifier: MIT
++ */
++
++/**
++ * Do 16-bit float arithmetic in 32 bits (INTEL_PROMOTE_F16=1, off by default).
++ *
++ * Not exact: intermediate results are no longer rounded to half precision.
++ * What it saves is layout traffic. A float to half conversion writes a
++ * dword-strided half while the 3-source half instructions need packed
++ * halves, and halves unpacked from a dword have the same problem, so mixed
++ * half/float code (as FSR4's preprocessing through vkd3d-proton) spends about
++ * half its instructions on copies between the two layouts.
++ */
++
++#include "compiler/nir/nir_builder.h"
++#include "util/u_debug.h"
++#include "jay_private.h"
++
++static unsigned
++promote_cb(const nir_instr *instr, void *data)
++{
++   if (instr->type != nir_instr_type_alu)
++      return 0;
++
++   const nir_alu_instr *alu = nir_instr_as_alu(instr);
++   const nir_op_info *info = &nir_op_infos[alu->op];
++   if (alu->def.bit_size != 16 || info->is_conversion ||
++       nir_alu_type_get_base_type(info->output_type) != nir_type_float)
++      return 0;
++
++   for (unsigned i = 0; i < info->num_inputs; i++) {
++      if (nir_alu_type_get_base_type(info->input_types[i]) != nir_type_float)
++         return 0;
++   }
++   return 32;
++}
++
++static bool
++fold_round_trip(nir_builder *b, nir_alu_instr *alu, void *data)
++{
++   /* f2f32(f2f16(x)) -> x for a 32-bit x */
++   if (alu->op != nir_op_f2f32 || alu->def.num_components != 1)
++      return false;
++
++   nir_alu_instr *src = nir_src_as_alu(alu->src[0].src);
++   if (!src || (src->op != nir_op_f2f16 && src->op != nir_op_f2f16_rtne &&
++                src->op != nir_op_f2f16_rtz) ||
++       src->src[0].src.ssa->bit_size != 32)
++      return false;
++
++   b->cursor = nir_before_instr(&alu->instr);
++   const unsigned c = src->src[0].swizzle[alu->src[0].swizzle[0]];
++   nir_def_replace(&alu->def, nir_channel(b, src->src[0].src.ssa, c));
++   return true;
++}
++
++bool
++jay_nir_promote_f16(nir_shader *nir)
++{
++   /* Compute only (FSR4's passes): graphics shaders keep the half throughput.
++    * Cooperative matrix code is laid out for its half types.
++    */
++   if (!debug_get_bool_option("INTEL_PROMOTE_F16", false) ||
++       nir->info.stage != MESA_SHADER_COMPUTE ||
++       nir->info.cs.has_cooperative_matrix)
++      return false;
++
++   bool progress = false;
++   NIR_PASS(progress, nir, nir_lower_bit_size, promote_cb, NULL);
++   if (!progress)
++      return false;
++
++   NIR_PASS(_, nir, nir_opt_constant_folding);
++   NIR_PASS(_, nir, nir_shader_alu_pass, fold_round_trip,
++            nir_metadata_control_flow, NULL);
++   NIR_PASS(_, nir, nir_opt_copy_prop);
++   NIR_PASS(_, nir, nir_opt_algebraic);
++   NIR_PASS(_, nir, nir_opt_dce);
++   return true;
++}
+diff --git a/src/intel/compiler/jay/jay_private.h b/src/intel/compiler/jay/jay_private.h
+index d4a94596308..5a6c8bc05a2 100644
+--- a/src/intel/compiler/jay/jay_private.h
++++ b/src/intel/compiler/jay/jay_private.h
+@@ -31,6 +31,7 @@ struct jay_fs_perprim_data {
+ bool jay_nir_lower_bool(nir_shader *nir);
+ bool jay_nir_lower_fsign(nir_shader *nir, unsigned verx10);
+ bool jay_nir_lower_bfloat_math(nir_shader *nir);
++bool jay_nir_promote_f16(nir_shader *nir);
+ bool jay_nir_dot4_to_dpas(nir_shader *nir,
+                           const struct intel_device_info *devinfo);
+ 
+diff --git a/src/intel/compiler/jay/meson.build b/src/intel/compiler/jay/meson.build
+index 9edd482a20e..8dcf1fb693c 100644
+--- a/src/intel/compiler/jay/meson.build
++++ b/src/intel/compiler/jay/meson.build
+@@ -60,6 +60,7 @@ libintel_compiler_jay_files = files(
+   'jay_lower_spill.c',
+   'jay_nir.c',
+   'jay_nir_dot4_to_dpas.c',
++  'jay_nir_promote_f16.c',
+   'jay_opt_dead_code.c',
+   'jay_opt_postra_vectorize.c',
+   'jay_opt_predicate.c',

@@ -1,0 +1,90 @@
+From 5094a1ce1ef59b7d0e5e1f1c64896753ab3ce961 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:02:25 -0300
+Subject: [PATCH 2/2] anv/xe2: switch CM Large GRF Mode off before trace rays
+ and internal compute
+
+XeSS CM kernels can leave Large GRF Mode on.  Turn it off before
+trace_rays, blorp compute, internal simple shaders and generated
+commands, like before ordinary compute dispatches.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit ccff7443e949d608261f58ea526ae1837eb192c4)
+---
+ src/intel/vulkan/genX_blorp_exec.c    | 4 ++++
+ src/intel/vulkan/genX_cmd_compute.c   | 8 +++++++-
+ src/intel/vulkan/genX_cmd_dgc.c       | 4 ++++
+ src/intel/vulkan/genX_simple_shader.c | 4 ++++
+ 4 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/intel/vulkan/genX_blorp_exec.c b/src/intel/vulkan/genX_blorp_exec.c
+index 2f537fdd921..f61d43b8832 100644
+--- a/src/intel/vulkan/genX_blorp_exec.c
++++ b/src/intel/vulkan/genX_blorp_exec.c
+@@ -470,6 +470,10 @@ blorp_exec_on_compute(struct blorp_batch *batch,
+    assert(cmd_buffer->queue_family->queueFlags & VK_QUEUE_COMPUTE_BIT);
+ 
+    genX(flush_pipeline_select_gpgpu)(cmd_buffer, false);
++#if GFX_VER == 20
++   /* Large GRF Mode off: CM kernels may have left it on (see genX(cmd_buffer_set_cm_large_grf)). */
++   genX(cmd_buffer_set_cm_large_grf)(cmd_buffer, false);
++#endif
+ 
+    /* Apply any outstanding flushes in case pipeline select haven't. */
+    genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
+diff --git a/src/intel/vulkan/genX_cmd_compute.c b/src/intel/vulkan/genX_cmd_compute.c
+index 7bd2e7990a9..bab21737360 100644
+--- a/src/intel/vulkan/genX_cmd_compute.c
++++ b/src/intel/vulkan/genX_cmd_compute.c
+@@ -481,7 +481,8 @@ genX(cmd_buffer_set_cm_large_grf)(struct anv_cmd_buffer *cmd_buffer, bool enable
+     * The mode is only switched when it changes, so a run of consecutive CM dispatches (XeSS issues dozens
+     * per frame) pays for one transition instead of two per dispatch. Ordinary shaders are correct in Large
+     * GRF Mode (they only lose occupancy), so the mode is switched back off before the next non-CM compute
+-    * walker and at the end of every command buffer, which also lets each command buffer assume it starts
++    * walker (dispatches, trace rays, blorp compute, internal simple shaders, generated commands) and at the
++    * end of every command buffer, which also lets each command buffer assume it starts
+     * off. The stall on each side is needed because the mode applies to every thread in flight. */
+    if (cmd_buffer->state.compute.cm_large_grf == enable)
+       return;
+@@ -1593,6 +1594,11 @@ cmd_buffer_trace_rays(struct anv_cmd_buffer *cmd_buffer,
+ 
+    trace_intel_begin_rays(&cmd_buffer->trace);
+ 
++#if GFX_VER == 20
++   /* Large GRF Mode off: CM kernels may have left it on (see genX(cmd_buffer_set_cm_large_grf)). */
++   genX(cmd_buffer_set_cm_large_grf)(cmd_buffer, false);
++#endif
++
+    cmd_buffer->state.rt.trace_rays_active = true;
+ 
+    /* Allocate and set up our RT_DISPATCH_GLOBALS */
+diff --git a/src/intel/vulkan/genX_cmd_dgc.c b/src/intel/vulkan/genX_cmd_dgc.c
+index 884c40078aa..defcfdb4c44 100644
+--- a/src/intel/vulkan/genX_cmd_dgc.c
++++ b/src/intel/vulkan/genX_cmd_dgc.c
+@@ -1058,6 +1058,10 @@ void genX(CmdExecuteGeneratedCommandsEXT)(
+       struct anv_cmd_compute_state *comp_state = &cmd_buffer->state.compute;
+ 
+       genX(flush_pipeline_select_gpgpu)(cmd_buffer, false);
++#if GFX_VER == 20
++      /* Large GRF Mode off: CM kernels may have left it on (see genX(cmd_buffer_set_cm_large_grf)). */
++      genX(cmd_buffer_set_cm_large_grf)(cmd_buffer, false);
++#endif
+ 
+       if (pGeneratedCommandsInfo->sequenceCountAddress != 0) {
+          struct anv_address seq_count_addr =
+diff --git a/src/intel/vulkan/genX_simple_shader.c b/src/intel/vulkan/genX_simple_shader.c
+index ec762bac754..bc9c1b64d63 100644
+--- a/src/intel/vulkan/genX_simple_shader.c
++++ b/src/intel/vulkan/genX_simple_shader.c
+@@ -404,6 +404,10 @@ genX(emit_simpler_shader_init_compute)(struct anv_simple_shader *state)
+    const struct brw_cs_prog_data *prog_data =
+       (const struct brw_cs_prog_data *) cs_bin->prog_data;
+    if (state->cmd_buffer != NULL) {
++#if GFX_VER == 20
++      /* Large GRF Mode off: CM kernels may have left it on (see genX(cmd_buffer_set_cm_large_grf)). */
++      genX(cmd_buffer_set_cm_large_grf)(state->cmd_buffer, false);
++#endif
+       genX(cmd_buffer_ensure_cfe_state)(state->cmd_buffer,
+                                         prog_data->base.total_scratch);
+    } else {

@@ -1,0 +1,43 @@
+From 450e0c4efb50e9bb6872855ff6acba4ae88769e0 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 16:18:26 -0300
+Subject: [PATCH 09/10] anv/xe2: only flush L1/L2 for a MEMORY_WRITE
+ destination access
+
+On Gfx20+ a MEMORY_WRITE source access already flushes only L1/L2, since
+all the fixed functions are L3 coherent. The destination side still asked
+for ANV_PIPE_BARRIER_FLUSH_BITS, whose tile/data cache flushes become
+ForceDeviceCoherency on Xe2 and also rule out RESOURCE_BARRIER, so the
+barrier falls back to a stalling PIPE_CONTROL.
+
+vkd3d-proton uses MEMORY_READ|MEMORY_WRITE for the D3D12 COMMON state,
+so every transition to COMMON took that path.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/vulkan/genX_cmd_buffer.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/intel/vulkan/genX_cmd_buffer.c b/src/intel/vulkan/genX_cmd_buffer.c
+index 2387a0f2893..3f93d198bad 100644
+--- a/src/intel/vulkan/genX_cmd_buffer.c
++++ b/src/intel/vulkan/genX_cmd_buffer.c
+@@ -5289,9 +5289,16 @@ anv_pipe_invalidate_bits_for_access_flags(struct anv_cmd_buffer *cmd_buffer,
+          break;
+       case VK_ACCESS_2_MEMORY_WRITE_BIT:
+          /* Generic write, make sure all previously written things land in
+-          * memory.
++          * memory. On Gfx20+ all the fixed functions are L3 coherent, so like
++          * for a MEMORY_WRITE source access, flushing L1/L2 is enough. The L3
++          * flush would also rule out RESOURCE_BARRIER for this barrier, and
++          * vkd3d-proton emits this access for every transition to the D3D12
++          * COMMON state.
+           */
+-         pipe_bits |= ANV_PIPE_BARRIER_FLUSH_BITS;
++         if (device->info->ver < 20)
++            pipe_bits |= ANV_PIPE_BARRIER_FLUSH_BITS;
++         else
++            pipe_bits |= ANV_PIPE_L1_L2_BARRIER_FLUSH_BITS;
+          break;
+       case VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT:
+       case VK_ACCESS_2_TRANSFORM_FEEDBACK_COUNTER_READ_BIT_EXT:

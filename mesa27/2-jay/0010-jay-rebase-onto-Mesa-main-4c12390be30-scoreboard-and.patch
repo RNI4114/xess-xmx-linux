@@ -1,0 +1,235 @@
+From 7bd80fbf8a15234c4b1ea3b0a52c513285a3804a Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:38:57 -0300
+Subject: [PATCH 10/10] jay: rebase onto Mesa main 4c12390be30: scoreboard and
+ BTD SIMD width as merged
+
+The commits of this part were written on an older Mesa; replayed on
+4c12390be30 these two places came out different from the merge that was
+tested: jay_lower_scoreboard.c as resolved there, and main's BTD width
+clamp in jay_emit_btd_ops.
+---
+ src/intel/compiler/jay/jay_from_nir.c         |   4 +-
+ src/intel/compiler/jay/jay_lower_scoreboard.c | 114 ++++++------------
+ 2 files changed, 36 insertions(+), 82 deletions(-)
+
+diff --git a/src/intel/compiler/jay/jay_from_nir.c b/src/intel/compiler/jay/jay_from_nir.c
+index 3c59bd10235..c49b468a27f 100644
+--- a/src/intel/compiler/jay/jay_from_nir.c
++++ b/src/intel/compiler/jay/jay_from_nir.c
+@@ -2118,8 +2118,8 @@ jay_emit_btd_ops(struct nir_to_jay_state *nj, nir_intrinsic_instr *instr)
+       jay_SCHEDULE_BARRIER(&nj->bld);
+    }
+ 
+-   assert(nj->s->dispatch_width <= 16 || synchronous);
+-   assert(nj->s->dispatch_width <= 16 && "TODO: Ray query SIMD splitting");
++   unsigned width = MIN2(s->dispatch_width, 16);
++   assert(width <= 16 || synchronous);
+ 
+    uint32_t desc = 0;
+    uint32_t split_len = 0;
+diff --git a/src/intel/compiler/jay/jay_lower_scoreboard.c b/src/intel/compiler/jay/jay_lower_scoreboard.c
+index 36df1c0adc5..32bca7e3579 100644
+--- a/src/intel/compiler/jay/jay_lower_scoreboard.c
++++ b/src/intel/compiler/jay/jay_lower_scoreboard.c
+@@ -205,44 +205,9 @@ store_sbid_edge(struct swsb_sbid_edge *dst, const struct swsb_sbid_edge *src)
+    validate_edge(dst);
+ }
+ 
+-/** Check for equivelance between two edges */
++/** Merges bits from src into dst, returns true if dst changed */
+ static inline bool
+-compare_sbid_edges(const struct swsb_sbid_edge *a,
+-                   const struct swsb_sbid_edge *b) {
+-   validate_edge(a);
+-   validate_edge(b);
+-   uint32_t busy = 0;
+-
+-   if (a->tdr_state != b->tdr_state) {
+-      return false;
+-   }
+-
+-   jay_foreach_sbid_dep_type(type) {
+-      if (a->tokens_busy[type] != b->tokens_busy[type]) {
+-         return false;
+-      }
+-
+-      busy |= a->tokens_busy[type];
+-   }
+-
+-   u_foreach_bit(sbid, busy) {
+-      jay_foreach_sbid_dep_type(type) {
+-         if ((a->tokens_busy[type] & BITFIELD_BIT(sbid)) &&
+-             memcmp(bitset_for(a, sbid, type), bitset_for(b, sbid, type),
+-                    a->ctx->words * sizeof(BITSET_WORD))) {
+-            return false;
+-         }
+-      }
+-   }
+-
+-   return true;
+-}
+-
+-/** Merges two edges together and stores the result in out */
+-static inline void
+-merge_sbid_edges(const struct swsb_sbid_edge *a,
+-                 const struct swsb_sbid_edge *b,
+-                 struct swsb_sbid_edge *out)
++merge_bitsets(BITSET_WORD *dst, const BITSET_WORD *src, unsigned words)
+ {
+    BITSET_WORD changed = 0;
+ 
+@@ -580,7 +545,7 @@ max_dependence(gen_pipe pipe)
+ }
+ 
+ /*
+- * RegDist tracking slots: every register file jay_def_to_range covers, plus
++ * RegDist tracking slots: every register file jay_def_to_footprint covers, plus
+  * one slot for the address register. a0 is written by in-order instructions
+  * (message descriptors, shuffle offsets) and read right after by SENDs and
+  * indirect MOVs, possibly from another pipe, so it needs RegDist tracking like
+@@ -589,7 +554,7 @@ max_dependence(gen_pipe pipe)
+ static inline unsigned
+ regdist_slots(jay_shader *shader)
+ {
+-   return jay_range_base(shader, ~0) + 1;
++   return jay_footprint_base(shader, ~0) + 1;
+ }
+ 
+ static void
+@@ -599,9 +564,9 @@ depend_on_writer(struct swsb_regdist_state *state,
+                  gen_pipe exec,
+                  bool except_exec)
+ {
+-   for (unsigned i = 0; i < r.width; ++i) {
+-      assert(r.base + i < regdist_slots(state->shader));
+-      uint32_t w = state->access[r.base + i][0];
++   jay_foreach_in_footprint(r, key) {
++      assert(key < regdist_slots(state->shader));
++      uint32_t w = state->access[key][0];
+       gen_pipe write = writer_pipe(w);
+ 
+       /* We omit write-after-{read,write} dependencies (except_exec) within a
+@@ -627,36 +592,23 @@ depend_on_writer(struct swsb_regdist_state *state,
+  * left unsynchronized, corrupting predicates. Widen the tracked range to the
+  * whole physical register. a0 gets its own slot (see regdist_slots).
+  */
+-static struct jay_range
+-regdist_range(jay_function *func, jay_inst *I, jay_def x)
++static struct jay_footprint
++regdist_footprint(jay_function *func, jay_inst *I, jay_def x, enum jay_type type)
+ {
+-   struct jay_range r = jay_def_to_range(func, I, x);
+    jay_shader *s = func->shader;
+ 
+    if (x.file == J_ADDRESS)
+-      return (struct jay_range){ jay_range_base(s, ~0), 1 };
++      return (struct jay_footprint){ jay_footprint_base(s, ~0), 1, 1, 1 };
+ 
+-   if (x.file == FLAG && r.width && jay_phys_flag_per_virt(s) == 1) {
+-      unsigned base = jay_range_base(s, FLAG);
+-      unsigned lo = (r.base - base) & ~1u;
+-      unsigned hi = MIN2(ALIGN_POT(r.base - base + r.width, 2),
+-                         s->num_regs[FLAG]);
+-      r.base = base + lo;
+-      r.width = hi - lo;
+-   }
++   struct jay_footprint r = jay_def_to_footprint(func, I, x, type);
+ 
+-   /* The integer accumulator of a 32-bit multiply (MUL_32_PART writing acc0,
+-    * MACL reading it back) spans two physical accumulators in SIMD16, which
+-    * jay_assign_accumulators already models as interference. Track both, or a
+-    * float-pipe access to acc1 next to the pair goes unsynchronized and
+-    * corrupts the product (seen as exploding vertices in skinning shaders).
+-    */
+-   if (x.file == ACCUM && r.width && jay_num_accums(s) == 4 &&
+-       (I->op == JAY_OPCODE_MUL_32_PART || I->op == JAY_OPCODE_MACL)) {
+-      unsigned base = jay_range_base(s, ACCUM);
++   /* Flag footprints are one slot per virtual flag, contiguous. */
++   if (x.file == FLAG && r.count && jay_phys_flag_per_virt(s) == 1) {
++      unsigned base = jay_footprint_base(s, FLAG);
+       unsigned lo = (r.base - base) & ~1u;
+-      r.base = base + lo;
+-      r.width = 2;
++      unsigned hi = MIN2(ALIGN_POT(r.base - base + r.count, 2),
++                         s->num_regs[FLAG]);
++      r = (struct jay_footprint){ base + lo, 1, 1, hi - lo };
+    }
+ 
+    return r;
+@@ -670,7 +622,7 @@ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+    jay_def dsts[3] = { I->dst, I->cond_flag };
+ 
+    for (unsigned i = 0; i < ARRAY_SIZE(dsts); ++i) {
+-      struct jay_range r = regdist_range(func, I, dsts[i]);
++      struct jay_footprint r = regdist_footprint(func, I, dsts[i], I->type);
+       depend_on_writer(ctx, r, dep, exec_pipe, true /* except_pipe */);
+ 
+       jay_foreach_in_footprint(r, key) {
+@@ -693,8 +645,10 @@ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+     */
+    jay_foreach_src(I, s) {
+       bool except_pipe = I->src[s].file == ACCUM || I->src[s].file == FLAG;
+-      depend_on_writer(ctx, regdist_range(func, I, I->src[s]), dep,
+-                       exec_pipe, except_pipe);
++      depend_on_writer(ctx,
++                       regdist_footprint(func, I, I->src[s],
++                                         jay_src_type(I, s)),
++                       dep, exec_pipe, except_pipe);
+    }
+ 
+    uint32_t wait_pipes = 0;
+@@ -794,7 +748,8 @@ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+       uint32_t now = make_writer(exec_pipe, ctx->ip[exec_pipe]);
+ 
+       for (unsigned i = 0; i < ARRAY_SIZE(dsts); ++i) {
+-         struct jay_range r = regdist_range(func, I, dsts[i]);
++         struct jay_footprint r =
++            regdist_footprint(func, I, dsts[i], I->type);
+ 
+          jay_foreach_in_footprint(r, key) {
+             ctx->access[key][0] = now;
+@@ -802,9 +757,11 @@ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+       }
+ 
+       jay_foreach_src(I, s) {
+-         struct jay_range r = regdist_range(func, I, I->src[s]);
+-         for (unsigned i = 0; i < r.width; ++i) {
+-            ctx->access[r.base + i][exec_pipe] = ctx->ip[exec_pipe];
++         struct jay_footprint r =
++            regdist_footprint(func, I, I->src[s], jay_src_type(I, s));
++
++         jay_foreach_in_footprint(r, key) {
++            ctx->access[key][exec_pipe] = ctx->ip[exec_pipe];
+          }
+       }
+    }
+@@ -889,14 +846,12 @@ jay_lower_scoreboard(jay_shader *shader)
+       /* Propagate SBID dependencies until a fixed point is reached */
+       while (!u_worklist_is_empty(&sbid_worklist)) {
+          jay_block *block = jay_worklist_pop_tail(&sbid_worklist);
+-         struct swsb_sbid_edge *edge = &sbid_state.edges[block->index];
+-         merge_sbid_edges_of_preds(&sbid_state, block, &sbid_state.tmp);
++         store_sbid_edge(&sbid_state.tmp, &sbid_state.edges[block->index]);
+          lower_sbid_local(f, block, &sbid_state.tmp, false);
+ 
+-         if (!compare_sbid_edges(&sbid_state.tmp, edge)) {
+-            SWAP(sbid_state.tmp, *edge);
+-
+-            jay_foreach_successor(block, succ, UGPR) {
++         jay_foreach_successor(block, succ, UGPR) {
++            struct swsb_sbid_edge *edge = &sbid_state.edges[(*succ)->index];
++            if (merge_sbid_edges(edge, &sbid_state.tmp)) {
+                jay_worklist_push_tail(&sbid_worklist, *succ);
+             }
+          }
+@@ -904,8 +859,7 @@ jay_lower_scoreboard(jay_shader *shader)
+ 
+       /* Apply the finished SBID dependencies to the program */
+       jay_foreach_block(f, block) {
+-         merge_sbid_edges_of_preds(&sbid_state, block, &sbid_state.tmp);
+-         lower_sbid_local(f, block, &sbid_state.tmp, true);
++         lower_sbid_local(f, block, &sbid_state.edges[block->index], true);
+       }
+ 
+       struct swsb_regdist_state regdist_state = {

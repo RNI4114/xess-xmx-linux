@@ -1,0 +1,66 @@
+From bf636c12d4ffc163a1136dae3c090969e8b30f77 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 00:21:55 -0300
+Subject: [PATCH 04/10] anv: don't drain the pipeline for top-of-pipe buffer
+ markers
+
+vkCmdWriteBufferMarker2AMD / CmdWriteMarkerToMemoryAMD always added an
+end-of-pipe sync before the MI_STORE_DATA_IMM, whatever the stage. A
+TOP_OF_PIPE (or DRAW_INDIRECT) marker only has to land after the previous
+commands were processed by the command streamer, which is where the
+MI_STORE_DATA_IMM executes, so skip the sync on platforms whose CS is
+coherent with L3. vkd3d-proton maps D3D12 WriteBufferImmediate MARKER_IN
+to TOP_OF_PIPE; Cyberpunk writes ~250 markers a frame.
+
+tlascheck TC_MARKERS=1: 160k marker values checked, 0 wrong. No gain
+measured when a MARKER_IN directly follows a MARKER_OUT (the OUT drain
+already emptied the pipe); not measured in the game yet.
+
+ANV_MARKER_SYNC=1 restores the sync for every marker (A/B).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit bd50f840f7a474d3c7c496b02ed0d698afd57402)
+(cherry picked from commit ca9ddd918249259ca916f924e65417774ba1516c)
+---
+ src/intel/vulkan/genX_cmd_buffer.c | 28 ++++++++++++++++++++++++----
+ 1 file changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/src/intel/vulkan/genX_cmd_buffer.c b/src/intel/vulkan/genX_cmd_buffer.c
+index 412d2831376..b2ad1a59103 100644
+--- a/src/intel/vulkan/genX_cmd_buffer.c
++++ b/src/intel/vulkan/genX_cmd_buffer.c
+@@ -8340,10 +8340,30 @@ void genX(CmdWriteMarkerToMemoryAMD)(
+ 
+    trace_intel_begin_write_buffer_marker(&cmd_buffer->trace);
+ 
+-   anv_add_pending_pipe_bits(cmd_buffer, pInfo->stage,
+-                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+-                             bits, "write buffer marker");
+-   genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
++   /* A marker for the top of the pipe (D3D12 WriteBufferImmediate
++    * MARKER_IN, through vkd3d-proton) only has to land after the previous
++    * commands were processed by the command streamer, which is where the
++    * MI_STORE_DATA_IMM below executes. Draining the whole pipeline for it
++    * put a bubble in the GPU at every marker: Cyberpunk writes ~250 a frame.
++    * Pending barriers stay pending, they don't concern the CS write.
++    *
++    * ANV_MARKER_SYNC=1 restores the end-of-pipe sync for every marker (A/B).
++    */
++   static int marker_sync = -1;
++   if (marker_sync < 0)
++      marker_sync = debug_get_bool_option("ANV_MARKER_SYNC", false);
++   const VkPipelineStageFlags2 cs_stages =
++      VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT |
++      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
++   const bool cs_only = !marker_sync && (pInfo->stage & ~cs_stages) == 0 &&
++      ANV_DEVINFO_HAS_COHERENT_L3_CS(cmd_buffer->device->info);
++
++   if (!cs_only) {
++      anv_add_pending_pipe_bits(cmd_buffer, pInfo->stage,
++                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
++                                bits, "write buffer marker");
++      genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
++   }
+ 
+    struct mi_builder b;
+    mi_builder_init(&b, cmd_buffer->device->info, &cmd_buffer->batch);

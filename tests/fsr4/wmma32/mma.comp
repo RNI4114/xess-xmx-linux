@@ -1,0 +1,30 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// D(16x16 f32) = A(16x64 f16) * B(64x16 f16) + C(16x16 f32). BCM: B read column-major from its transpose.
+// DCM: D stored column-major.
+layout(std430, binding = 0) readonly buffer BA { float16_t A[]; };
+layout(std430, binding = 1) readonly buffer BB { float16_t B[]; };   // 64x16 row-major, then 16x64 (its transpose)
+layout(std430, binding = 2) readonly buffer BC { float C[]; };
+layout(std430, binding = 3) buffer BD { float D[]; };
+void main()
+{
+   CM(float, gl_MatrixUseAccumulator) acc;
+   coopMatLoad(acc, C, 0, 16, RM);
+   for (uint k = 0; k < 64; k += 16) {
+      CM(float16_t, gl_MatrixUseA) a;
+      CM(float16_t, gl_MatrixUseB) b;
+      coopMatLoad(a, A, k, 64, RM);
+#ifdef BCM
+      coopMatLoad(b, B, 64 * 16 + k, 64, CMJ);
+#else
+      coopMatLoad(b, B, k * 16, 16, RM);
+#endif
+      acc = coopMatMulAdd(a, b, acc);
+   }
+#ifdef DCM
+   coopMatStore(acc, D, 0, 16, CMJ);
+#else
+   coopMatStore(acc, D, 0, 16, RM);
+#endif
+}

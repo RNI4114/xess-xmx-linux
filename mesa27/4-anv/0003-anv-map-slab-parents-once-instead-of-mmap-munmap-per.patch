@@ -1,0 +1,84 @@
+From c49791394493c2d8c67cadf4a52360e9e17efa5c Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 17:25:59 -0300
+Subject: [PATCH 03/10] anv: map slab parents once instead of mmap/munmap per
+ slab entry
+
+Slab entries allocated with ANV_BO_ALLOC_MAPPED were each mmapped on
+alloc and munmapped on free. anv_bo_pool does not keep slab-backed BOs on
+its free lists, so every batch BO of every command buffer paid an
+mmap/munmap pair, and each munmap a TLB shootdown on all cores running
+the process. Map the slab parent lazily once and point the entries into
+that mapping; anv_bo_finish unmaps it when the parent is released.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit da501b99c5b2f2386ad96acce2f7839cd885ee49)
+(cherry picked from commit 562988d764c843d3d7250b59c0a835ee12ae5dce)
+---
+ src/intel/vulkan/anv_slab_bo.c | 36 +++++++++++++++++++++++++++++-----
+ 1 file changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/src/intel/vulkan/anv_slab_bo.c b/src/intel/vulkan/anv_slab_bo.c
+index 0a543b8222f..bdafe13d452 100644
+--- a/src/intel/vulkan/anv_slab_bo.c
++++ b/src/intel/vulkan/anv_slab_bo.c
+@@ -111,6 +111,32 @@ anv_slab_bo_is_disabled(struct anv_device *device)
+    return device->bo_slabs[0].num_heaps == 0;
+ }
+ 
++/* Map the whole slab parent once, on first use, and keep it mapped until the
++ * parent is released (anv_bo_finish unmaps it). Mapping each entry on alloc
++ * and unmapping it on free costs an mmap/munmap pair (and a TLB shootdown on
++ * every core running the process) per entry, and slab entries are not kept
++ * on the anv_bo_pool free lists, so batch BOs hit this for every command
++ * buffer.
++ */
++static void *
++anv_slab_parent_map(struct anv_device *device, struct anv_bo *parent)
++{
++   void *map = p_atomic_read(&parent->map);
++   if (map)
++      return map;
++
++   if (anv_device_map_bo(device, parent, 0, parent->size, NULL, &map) != VK_SUCCESS)
++      return NULL;
++
++   void *old = p_atomic_cmpxchg(&parent->map, NULL, map);
++   if (old) {
++      anv_device_unmap_bo(device, parent, map, parent->size, false /* replace */);
++      return old;
++   }
++
++   return map;
++}
++
+ struct anv_bo *
+ anv_slab_bo_alloc(struct anv_device *device, const char *name, uint64_t requested_size,
+                   uint32_t alignment, enum anv_bo_alloc_flags alloc_flags)
+@@ -166,10 +192,12 @@ anv_slab_bo_alloc(struct anv_device *device, const char *name, uint64_t requeste
+    assert((intel_48b_address(bo->offset) & (alignment - 1)) == 0);
+ 
+    if (alloc_flags & ANV_BO_ALLOC_MAPPED) {
+-      if (anv_device_map_bo(device, bo, 0, bo->size, NULL, &bo->map) != VK_SUCCESS) {
++      void *parent_map = anv_slab_parent_map(device, bo->slab_parent);
++      if (!parent_map) {
+          anv_slab_bo_free(device, bo);
+          return NULL;
+       }
++      bo->map = parent_map + (bo->offset - bo->slab_parent->offset);
+    }
+ 
+    return bo;
+@@ -180,10 +208,8 @@ anv_slab_bo_free(struct anv_device *device, struct anv_bo *bo)
+ {
+    assert(bo->slab_parent);
+ 
+-   if (bo->map) {
+-      anv_device_unmap_bo(device, bo, bo->map, bo->size, false /* replace */);
+-      bo->map = NULL;
+-   }
++   /* The mapping belongs to the slab parent, see anv_slab_parent_map(). */
++   bo->map = NULL;
+ 
+    bo->refcount = 0;
+    pb_slab_free(get_slabs(device, bo->actual_size), &bo->slab_entry);

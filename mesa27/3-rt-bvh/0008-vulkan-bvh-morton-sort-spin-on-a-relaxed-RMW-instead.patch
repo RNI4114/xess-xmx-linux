@@ -1,0 +1,45 @@
+From 2a34cdcc8ba4fbe3af73c9ad827491dbb0d98c82 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 21:00:59 -0300
+Subject: [PATCH 08/21] vulkan/bvh: morton sort: spin on a relaxed RMW instead
+ of an acquire load
+
+An acquire load at device scope is a full L1 invalidate per spin iteration on
+Xe2, which also throws away the cached data of the workgroups still merging
+on the same core. Spin relaxed and rely on the acquire barrier after the
+loop. A relaxed atomic load may be served from a stale cache line (the
+counter left full by the previous build), so the spin uses atomicAdd(0).
+
+TLAS of 43.4k instances on a B580: sort 186 -> 169 us.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 0c2d76aa4d30fa3235343f0182a33d2cffc62515)
+(cherry picked from commit f8542ceb739892d85870cf21058dfcb32eba61d7)
+---
+ src/vulkan/runtime/bvh/morton_sort.comp | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/src/vulkan/runtime/bvh/morton_sort.comp b/src/vulkan/runtime/bvh/morton_sort.comp
+index 0db8fef5974..2ea094c4f94 100644
+--- a/src/vulkan/runtime/bvh/morton_sort.comp
++++ b/src/vulkan/runtime/bvh/morton_sort.comp
+@@ -605,11 +605,15 @@ main()
+          continue;
+       }
+ 
+-      /* Spin waiting for outstanding work to finish. */
++      /* Spin waiting for outstanding work to finish. The spin is relaxed: the acquire barrier below
++       * synchronizes once it exits. An acquire in the loop is a full L1 invalidate per iteration on
++       * some GPUs (Xe2), which also throws away the cached data of the workgroups still merging on
++       * the same core. A read-modify-write is used because a relaxed atomic load may be served from
++       * a stale cache line (e.g. the counter left full by a previous build).
++       */
+       if (gl_LocalInvocationID.x == 0) {
+-         while (atomicLoad(DEREF(INDEX(morton_ready_count, args.counts, log2_multiplier - 1)).done, gl_ScopeDevice,
+-                           gl_StorageSemanticsBuffer,
+-                           gl_SemanticsAcquire | gl_SemanticsMakeVisible) < gl_NumWorkGroups.x) {}
++         while (atomicAdd(DEREF(INDEX(morton_ready_count, args.counts, log2_multiplier - 1)).done, 0, gl_ScopeDevice,
++                          0, gl_SemanticsRelaxed) < gl_NumWorkGroups.x) {}
+       }
+ 
+       barrier();

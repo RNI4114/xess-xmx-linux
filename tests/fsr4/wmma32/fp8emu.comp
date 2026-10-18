@@ -1,0 +1,43 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// The vkd3d-proton FP8 emulation pattern: u8 matrices in memory, element loops to and from f16 of the same use.
+// A, B: u8 (value v means v - 128), D = A*B + bias; out: u8 = clamp(D/64 + 128), same use (accumulator).
+// ACM / BCM: A / B column-major in memory. OCM: output column-major.
+layout(std430, binding = 0) readonly buffer BA { uint8_t A[]; };
+layout(std430, binding = 1) readonly buffer BB { uint8_t B[]; };
+layout(std430, binding = 2) readonly buffer BC { float C[]; };
+layout(std430, binding = 3) buffer BD { uint8_t D[]; };
+void main()
+{
+   CM(uint8_t, gl_MatrixUseA) a8;
+   CM(uint8_t, gl_MatrixUseB) b8;
+#ifdef ACM
+   coopMatLoad(a8, A, 0, 16, CMJ);
+#else
+   coopMatLoad(a8, A, 0, 16, RM);
+#endif
+#ifdef BCM
+   coopMatLoad(b8, B, 0, 16, CMJ);
+#else
+   coopMatLoad(b8, B, 0, 16, RM);
+#endif
+   CM(float16_t, gl_MatrixUseA) a;
+   CM(float16_t, gl_MatrixUseB) b;
+   for (int i = 0; i < a.length(); i++)
+      a[i] = float16_t(int(a8[i]) - 128);
+   for (int i = 0; i < b.length(); i++)
+      b[i] = float16_t(int(b8[i]) - 128);
+   CM(float, gl_MatrixUseAccumulator) acc;
+   coopMatLoad(acc, C, 0, 16, RM);
+   acc = coopMatMulAdd(a, b, acc);
+   CM(float16_t, gl_MatrixUseAccumulator) h = CM(float16_t, gl_MatrixUseAccumulator)(acc);
+   CM(uint8_t, gl_MatrixUseAccumulator) o;
+   for (int i = 0; i < h.length(); i++)
+      o[i] = uint8_t(clamp(float(h[i]) / 64.0 + 128.0, 0.0, 255.0));
+#ifdef OCM
+   coopMatStore(o, D, 0, 16, CMJ);
+#else
+   coopMatStore(o, D, 0, 16, RM);
+#endif
+}

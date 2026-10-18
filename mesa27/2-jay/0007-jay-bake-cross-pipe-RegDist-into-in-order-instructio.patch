@@ -1,0 +1,41 @@
+From c2e7caeeb4676da137b03ad82b557863635a21fa Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 18:31:12 -0300
+Subject: [PATCH 07/10] jay: bake cross-pipe RegDist into in-order instructions
+ on Xe-HP+
+
+lower_regdist() put every dependency on a pipe other than the inferred one
+into a separate SYNC.nop, which is only required on Gfx12.0 (no pipe field
+in the SWSB) and for instructions that also take an SBID. Since Xe-HP the
+SWSB of an in-order instruction can name the pipe (or A@n for several
+pipes), which is what brw does (baked_ordered_dependency_mode).
+
+Wuthering Waves RT shaders are bound on instruction fetch, and these
+SYNC.nop were 9.1% of their code. ptbench: raygen code -7..-12%, all
+shaders -4.9% bytes; I-cache bound 'huge' raygen 161.7 -> 135.5 ms,
+images bit-identical. vkd3d-proton d3d12 suite and rtpipe matrix unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ src/intel/compiler/jay/jay_lower_scoreboard.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/intel/compiler/jay/jay_lower_scoreboard.c b/src/intel/compiler/jay/jay_lower_scoreboard.c
+index ff44d299bfe..36df1c0adc5 100644
+--- a/src/intel/compiler/jay/jay_lower_scoreboard.c
++++ b/src/intel/compiler/jay/jay_lower_scoreboard.c
+@@ -730,8 +730,14 @@ lower_regdist(jay_function *func, jay_inst *I, struct swsb_regdist_state *ctx)
+ 
+    /* DPAS and slow ALU on Gfx12 can only represent in-order dependency for its.
+     * inferred pipe, so if it depends on something else, add an extra SYNC.nop.
++    * Since Xe-HP the SWSB of an in-order instruction carries an explicit pipe
++    * (or A@n for several pipes), so like brw (baked_ordered_dependency_mode)
++    * only instructions that also take an SBID need the extra SYNC there.
+     */
++   const bool explicit_pipe = func->shader->devinfo->verx10 >= 125 && !has_sbid;
++
+    if (I->op != JAY_OPCODE_SEND &&
++       !explicit_pipe &&
+        wait_pipes &&
+        (!single_wait ||
+         last_pipe != jay_inferred_sync_pipe(func->shader->devinfo, I))) {

@@ -1,0 +1,124 @@
+From 83355cb9bff519c22f7d6a5e2666c9034019dd07 Mon Sep 17 00:00:00 2001
+From: askimi <44218719+RNI4114@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 16:35:23 -0300
+Subject: [PATCH 06/10] anv: keep empty slab parent BOs around instead of
+ freeing them
+
+pb_slab frees a slab as soon as all its entries are reclaimed, and the next
+allocation from that group creates a new one. With the batch BO pool this
+churns a 2 MB slab parent a few times per second in Cyberpunk 2077 (unbind
++ bind right after it). On xe an unbind only completes after all the GPU
+work in flight on the VM, and every exec waits on the last bind timeline
+point, so each churn drained the GPU pipeline.
+
+Keep up to 8 empty slab parents per device and hand them to new slabs with
+the same alloc flags. ANV_SLAB_PARENT_CACHE=0 restores the old behavior.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 41cc6bd0427655f890c13938873255938a9cf44c)
+(cherry picked from commit c0847635299b6c75e6ae579bb90b6f265e6ee591)
+---
+ src/intel/vulkan/anv_private.h | 11 ++++++++
+ src/intel/vulkan/anv_slab_bo.c | 48 +++++++++++++++++++++++++++++++---
+ 2 files changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/src/intel/vulkan/anv_private.h b/src/intel/vulkan/anv_private.h
+index be3130e8e1e..a7c27f0b05f 100644
+--- a/src/intel/vulkan/anv_private.h
++++ b/src/intel/vulkan/anv_private.h
+@@ -2960,6 +2960,17 @@ struct anv_device {
+ 
+    struct pb_slabs bo_slabs[3];
+ 
++   /* Empty slab parent BOs kept around for reuse: freeing one unbinds it, and
++    * on xe an unbind completes only after all the GPU work in flight on the
++    * VM, while every following submission waits on the bind timeline.
++    */
++   struct {
++      simple_mtx_t mutex;
++      unsigned count;
++      struct anv_bo *bos[8];
++   } slab_parent_cache;
++   bool slab_parent_cache_enabled;
++
+    struct {
+       mtx_t mutex;
+       struct u_cnd_monotonic lost_cnd;
+diff --git a/src/intel/vulkan/anv_slab_bo.c b/src/intel/vulkan/anv_slab_bo.c
+index bdafe13d452..b060811f464 100644
+--- a/src/intel/vulkan/anv_slab_bo.c
++++ b/src/intel/vulkan/anv_slab_bo.c
+@@ -297,9 +297,26 @@ anv_slab_alloc(void *priv,
+    /* allocate at least a 2MB buffer, this allows KMD to enable THP for this bo */
+    slab_parent_size = MAX2(slab_parent_size, 2 * 1024 * 1024);
+ 
+-   VkResult result;
+-   result = anv_device_alloc_bo(device, "slab_parent", slab_parent_size, alloc_flags,
+-                                0, &slab->bo);
++   VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   slab->bo = NULL;
++   simple_mtx_lock(&device->slab_parent_cache.mutex);
++   for (unsigned i = 0; i < device->slab_parent_cache.count; i++) {
++      struct anv_bo *bo = device->slab_parent_cache.bos[i];
++      if (bo->alloc_flags == alloc_flags && bo->actual_size >= slab_parent_size &&
++          bo->actual_size <= 2 * (uint64_t)slab_parent_size) {
++         slab->bo = bo;
++         device->slab_parent_cache.bos[i] =
++            device->slab_parent_cache.bos[--device->slab_parent_cache.count];
++         result = VK_SUCCESS;
++         break;
++      }
++   }
++   simple_mtx_unlock(&device->slab_parent_cache.mutex);
++
++   if (!slab->bo) {
++      result = anv_device_alloc_bo(device, "slab_parent", slab_parent_size,
++                                   alloc_flags, 0, &slab->bo);
++   }
+    if (result != VK_SUCCESS)
+       goto error_alloc_bo;
+ 
+@@ -350,7 +367,20 @@ anv_slab_free(void *priv, struct pb_slab *pslab)
+    struct anv_device *device = priv;
+    struct anv_slab *slab = (void *)pslab;
+ 
+-   anv_device_release_bo(device, slab->bo);
++   /* The slab is only freed once all its entries are idle, so the parent BO
++    * can be handed to the next slab without unbinding it.
++    */
++   bool cached = false;
++   if (device->slab_parent_cache_enabled) {
++      simple_mtx_lock(&device->slab_parent_cache.mutex);
++      if (device->slab_parent_cache.count < ARRAY_SIZE(device->slab_parent_cache.bos)) {
++         device->slab_parent_cache.bos[device->slab_parent_cache.count++] = slab->bo;
++         cached = true;
++      }
++      simple_mtx_unlock(&device->slab_parent_cache.mutex);
++   }
++   if (!cached)
++      anv_device_release_bo(device, slab->bo);
+ 
+    free(slab->entries);
+    free(slab);
+@@ -365,6 +395,11 @@ anv_slab_bo_init(struct anv_device *device)
+    unsigned num_slab_orders_per_allocator = (max_slab_order - min_slab_order) /
+                                             num_slab_allocator;
+ 
++   simple_mtx_init(&device->slab_parent_cache.mutex, mtx_plain);
++   device->slab_parent_cache.count = 0;
++   device->slab_parent_cache_enabled =
++      debug_get_bool_option("ANV_SLAB_PARENT_CACHE", true);
++
+    if (ANV_DEBUG(NO_SLAB))
+       return true;
+ 
+@@ -413,4 +448,9 @@ anv_slab_bo_deinit(struct anv_device *device)
+       if (device->bo_slabs[i].groups)
+          pb_slabs_deinit(&device->bo_slabs[i]);
+    }
++
++   for (unsigned i = 0; i < device->slab_parent_cache.count; i++)
++      anv_device_release_bo(device, device->slab_parent_cache.bos[i]);
++   device->slab_parent_cache.count = 0;
++   simple_mtx_destroy(&device->slab_parent_cache.mutex);
+ }
